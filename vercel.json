@@ -4,7 +4,7 @@
   "framework": "nextjs",
   "functions": {
     "api/rolibot.py": {
-      "maxDuration": 60,
+      "maxDuration": 120,
       "memory": 2048
     }
   }
