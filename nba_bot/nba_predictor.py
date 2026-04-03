@@ -11,7 +11,14 @@ warnings.filterwarnings('ignore')
 _IS_SERVERLESS = bool(os.environ.get("VERCEL") or os.environ.get("SERVERLESS"))
 _JSON_MODE = os.environ.get("ROLI_JSON", "").lower() in ("1", "true", "yes")
 _real_stdout = sys.stdout
-if _JSON_MODE:
+# JSON mode hides prints so stdout stays clean for optional `print(payload)` — but CI then
+# looks "stuck" for many minutes (train + APIs). Show progress when GitHub Actions runs the job.
+_json_suppress_stdout = _JSON_MODE and os.environ.get("GITHUB_ACTIONS", "").lower() not in (
+    "true",
+    "1",
+    "yes",
+)
+if _json_suppress_stdout:
     sys.stdout = open(os.devnull, "w", encoding="utf-8")
 
 if hasattr(sys.stdout, "reconfigure"):

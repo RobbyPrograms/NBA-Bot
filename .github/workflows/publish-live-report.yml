@@ -43,7 +43,8 @@ jobs:
         env:
           ROLI_JSON: "1"
           ROLI_JSON_OUT: ${{ github.workspace }}/roli-live-report.json
-        run: python nba_bot/nba_predictor.py
+        # -u: unbuffered logs (GITHUB_ACTIONS is set by GitHub so predictor keeps stdout for progress)
+        run: python -u nba_bot/nba_predictor.py
 
       - name: Push live-report.json to report-data branch
         env:
