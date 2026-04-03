@@ -1,0 +1,11 @@
+{
+  "buildCommand": "npm run build",
+  "installCommand": "npm install",
+  "framework": "nextjs",
+  "functions": {
+    "api/rolibot.py": {
+      "maxDuration": 120,
+      "memory": 3008
+    }
+  }
+}

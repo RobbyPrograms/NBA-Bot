@@ -1,0 +1,68 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html {
+  scroll-behavior: smooth;
+}
+
+/* Light — purple accents on soft gray */
+:root {
+  --surface-bg: #f3f0fa;
+  --card: #ffffff;
+  --card-inner: #f5f3ff;
+  --border: rgba(88, 28, 135, 0.12);
+  --text: #1e1b2e;
+  --muted: #64748b;
+  --accent: #7c3aed;
+  --accent-2: #a855f7;
+  --gold: #9333ea;
+  --glow-1: rgba(124, 58, 237, 0.2);
+  --glow-2: rgba(168, 85, 247, 0.15);
+  --glow-3: rgba(192, 132, 252, 0.12);
+  --shadow-sm: 0 2px 8px -2px rgba(15, 23, 42, 0.08);
+  --shadow-md: 0 12px 28px -8px rgba(88, 28, 135, 0.12);
+  --shadow-card: 0 4px 6px -1px rgba(15, 23, 42, 0.05), 0 10px 28px -12px rgba(124, 58, 237, 0.12),
+    0 0 0 1px rgba(88, 28, 135, 0.08);
+  --shadow-card-hover: 0 8px 16px -4px rgba(15, 23, 42, 0.08), 0 20px 40px -16px rgba(124, 58, 237, 0.15),
+    0 0 0 1px rgba(124, 58, 237, 0.15);
+}
+
+/* Dark — true black + electric purple */
+.dark {
+  --surface-bg: #000000;
+  --card: #0a0a0f;
+  --card-inner: #12121a;
+  --border: rgba(168, 85, 247, 0.22);
+  --text: #f1f5f9;
+  --muted: #94a3b8;
+  --accent: #c084fc;
+  --accent-2: #a855f7;
+  --gold: #e9d5ff;
+  --glow-1: rgba(168, 85, 247, 0.35);
+  --glow-2: rgba(147, 51, 234, 0.25);
+  --glow-3: rgba(192, 132, 252, 0.15);
+  --shadow-sm: 0 2px 12px -2px rgba(0, 0, 0, 0.8);
+  --shadow-md: 0 8px 32px -4px rgba(0, 0, 0, 0.9);
+  --shadow-card: 0 8px 32px -8px rgba(0, 0, 0, 0.85), 0 0 0 1px rgba(168, 85, 247, 0.15),
+    inset 0 1px 0 0 rgba(255, 255, 255, 0.03);
+  --shadow-card-hover: 0 16px 48px -12px rgba(0, 0, 0, 0.95), 0 0 0 1px rgba(192, 132, 252, 0.35),
+    0 0 48px -12px rgba(168, 85, 247, 0.2), inset 0 1px 0 0 rgba(255, 255, 255, 0.05);
+}
+
+body {
+  @apply antialiased;
+  background-color: var(--surface-bg);
+  color: var(--text);
+}
+
+@layer utilities {
+  .roli-table-head {
+    @apply text-[10px] font-semibold uppercase tracking-wider text-[var(--muted)];
+  }
+
+  /* Single column width for every dashboard section */
+  .roli-shell {
+    @apply mx-auto w-full max-w-6xl px-4 sm:px-6;
+  }
+}

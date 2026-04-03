@@ -4,8 +4,14 @@
 #  Opponent-Adjusted Props  •  Hot/Cold Streaks  •  Caching
 # ============================================================
 
-import os, sys, time, warnings, itertools, pickle, hashlib
+import os, sys, time, warnings, itertools, pickle, hashlib, json, urllib.request
 warnings.filterwarnings('ignore')
+
+_IS_SERVERLESS = bool(os.environ.get("VERCEL") or os.environ.get("SERVERLESS"))
+_JSON_MODE = os.environ.get("ROLI_JSON", "").lower() in ("1", "true", "yes")
+_real_stdout = sys.stdout
+if _JSON_MODE:
+    sys.stdout = open(os.devnull, "w", encoding="utf-8")
 
 if hasattr(sys.stdout, "reconfigure"):
     try:
@@ -41,7 +47,20 @@ KELLY_FRACTION    = 0.25    # Fractional Kelly (0.25 = quarter Kelly, safer)
 MAX_BET_PCT       = 0.05    # Never bet more than 5% of bankroll on one game
 MIN_EDGE_FOR_BET  = 0.03    # Minimum model edge to consider a bet
 MODEL_CACHE_FILE  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "model_cache.pkl")
+if os.environ.get("MODEL_CACHE_PATH"):
+    MODEL_CACHE_FILE = os.environ["MODEL_CACHE_PATH"]
 PROP_GAMES_BACK   = 20      # Recent games to use for prop analysis
+
+_SLEEP_SEASON = 0.35 if _IS_SERVERLESS else 2
+_SLEEP_RETRY  = 0.8 if _IS_SERVERLESS else 3
+_SLEEP_PROP   = 0.15 if _IS_SERVERLESS else 0.8
+
+# Populated during run for JSON / UI parity with CLI
+SEASON_PULL_LOG = []
+PROPS_FETCH_LOG = []
+XGB_EVAL_LOG = []
+INJURY_REPORT_META = {}
+PROPS_SKIPPED_INJURY = 0
 
 # ─────────────────────────────────────────────────────────────
 #  HELPERS
@@ -106,12 +125,86 @@ def trend_label(recent_avg, overall_avg):
     elif ratio <= 0.92: return "📉 COOLING"
     return ""
 
+
+def nba_season_string_for_date(d):
+    """NBA season label e.g. April 2026 → 2025-26; November 2025 → 2025-26."""
+    y, m = d.year, d.month
+    if m >= 10:
+        y0, y1 = y, y + 1
+    else:
+        y0, y1 = y - 1, y
+    return f"{y0}-{str(y1)[2:]}"
+
+
+def nba_seasons_from_2018_through(d):
+    """All season strings from 2018-19 through the season that contains `d`."""
+    end_label = nba_season_string_for_date(d)
+    end_y0 = int(end_label.split("-")[0])
+    return [f"{y}-{str(y + 1)[2:]}" for y in range(2018, end_y0 + 1)]
+
+
+def prev_nba_season(season_str):
+    y0 = int(season_str.split("-")[0])
+    return f"{y0 - 1}-{str(y0)[2:]}"
+
+
+def normalize_injury_display_name(name):
+    n = (name or "").lower().strip()
+    for suffix in (" jr.", " sr.", " ii", " iii", " iv", " v"):
+        if n.endswith(suffix):
+            n = n[: -len(suffix)].strip()
+    return " ".join(n.split())
+
+
+def fetch_espn_out_players():
+    """
+    Players listed as Out on ESPN's public injury feed (no API key).
+    Returns (set of normalized names, meta dict). On failure returns (empty set, meta with error).
+    """
+    url = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/injuries"
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": "RoliBotNBA/1.0 (stats; +https://github.com/nba-bot)"},
+    )
+    meta = {"source": "espn", "fetched_ok": False, "n_out": 0, "out_players": []}
+    out_set = set()
+    try:
+        with urllib.request.urlopen(req, timeout=25) as resp:
+            payload = json.loads(resp.read().decode("utf-8", errors="replace"))
+    except Exception as e:
+        meta["error"] = str(e)[:200]
+        return out_set, meta
+
+    for team_block in payload.get("injuries") or []:
+        team_name = team_block.get("displayName") or ""
+        for row in team_block.get("injuries") or []:
+            if (row.get("status") or "").strip().lower() != "out":
+                continue
+            ath = row.get("athlete") or {}
+            disp = (ath.get("displayName") or "").strip()
+            if not disp:
+                continue
+            key = normalize_injury_display_name(disp)
+            out_set.add(key)
+            meta["out_players"].append(
+                {"player": disp, "team": team_name, "status": row.get("status")}
+            )
+    meta["fetched_ok"] = True
+    meta["n_out"] = len(out_set)
+    return out_set, meta
+
+
+def player_listed_out(full_name, out_normalized_set):
+    if not full_name or not out_normalized_set:
+        return False
+    return normalize_injury_display_name(full_name) in out_normalized_set
+
 # ─────────────────────────────────────────────────────────────
 #  BANNER
 # ─────────────────────────────────────────────────────────────
 print()
 print("╔══════════════════════════════════════════════════════════╗")
-print("║   NBA AI BETTING PREDICTOR v3  •  ENSEMBLE + KELLY      ║")
+print("║   RoliBot NBA  •  Ensemble ML + Props + Kelly           ║")
 print("╚══════════════════════════════════════════════════════════╝")
 print(f"  Bankroll: ${BANKROLL:,.0f}  |  Kelly fraction: {KELLY_FRACTION:.0%}  |  Max bet: {MAX_BET_PCT:.0%}")
 print()
@@ -120,10 +213,12 @@ print()
 #  PHASE 1 — PULL RAW DATA
 # ============================================================
 print("━" * 60)
-print(" PHASE 1 — Pulling NBA game data (7 seasons)...")
+_run_date = date.today()
+_current_season = nba_season_string_for_date(_run_date)
+all_seasons = nba_seasons_from_2018_through(_run_date)
+print(f" PHASE 1 — Pulling NBA game data ({len(all_seasons)} seasons through {_current_season})...")
 print("━" * 60)
 
-all_seasons = ['2018-19','2019-20','2020-21','2021-22','2022-23','2023-24','2024-25']
 all_games   = []
 
 for season in all_seasons:
@@ -136,14 +231,15 @@ for season in all_seasons:
             )
             df = gf.get_data_frames()[0]
             all_games.append(df)
+            SEASON_PULL_LOG.append({"season": season, "rows": int(len(df))})
             print(f"✓  {len(df):,} rows")
             break
         except Exception as e:
             if attempt < 2:
-                time.sleep(3)
+                time.sleep(_SLEEP_RETRY)
             else:
                 print(f"✗  {e}")
-    time.sleep(2)
+    time.sleep(_SLEEP_SEASON)
 
 if not all_games:
     raise SystemExit("No data downloaded. Check network / nba_api.")
@@ -327,6 +423,14 @@ if not cache_valid:
         early_stopping_rounds=40, random_state=42, n_jobs=-1,
     )
     xgb_model.fit(X_train, y_train, eval_set=[(X_test, y_test)], verbose=100)
+    try:
+        er = xgb_model.evals_result()
+        ll_hist = er.get("validation_0", {}).get("logloss", [])
+        for i, v in enumerate(ll_hist):
+            if i == 0 or i % 100 == 0 or i == len(ll_hist) - 1:
+                XGB_EVAL_LOG.append({"iteration": int(i), "validation_logloss": float(v)})
+    except Exception:
+        pass
 
     # ── Random Forest ─────────────────────────────────────
     rf_model = RandomForestClassifier(
@@ -470,6 +574,14 @@ print("━" * 60)
 print(" PHASE 6B — Loading player stats for prop predictions...")
 print("━" * 60)
 
+OUT_PLAYER_KEYS, INJURY_REPORT_META = fetch_espn_out_players()
+if INJURY_REPORT_META.get("fetched_ok"):
+    print(f"  ✓ Injury report (ESPN): {INJURY_REPORT_META.get('n_out', 0)} players listed Out — excluded from props & parlays")
+elif INJURY_REPORT_META.get("error"):
+    print(f"  ! Injury report unavailable ({INJURY_REPORT_META['error'][:80]}) — props not injury-filtered")
+else:
+    print("  ! Injury report empty — props not injury-filtered")
+
 PROP_THRESHOLDS = {
     'PTS':  [10, 15, 20, 25, 30, 35],
     'REB':  [4, 6, 8, 10, 12, 14],
@@ -510,24 +622,47 @@ KEY_PLAYERS_BY_TEAM = {
     'MEM': ['Morant','Jackson','Smart','Konchar'],
 }
 
-def get_player_recent_stats(name_frag, season='2024-25', n_games=PROP_GAMES_BACK):
+def get_player_recent_stats(name_frag, n_games=PROP_GAMES_BACK):
+    """
+    Pull last n_games from the current NBA season via nba_api; if the log is short (early season),
+    prepend the previous season's games so thresholds stay meaningful.
+    """
     all_players = nba_players_static.get_players()
     matches = [p for p in all_players
                if name_frag.lower() in p['full_name'].lower() and p['is_active']]
     if not matches:
         return None, None
     player = matches[0]
-    try:
-        log = playergamelog.PlayerGameLog(
-            player_id=player['id'], season=season,
-            season_type_all_star='Regular Season'
-        )
-        df = log.get_data_frames()[0]
-        if df.empty:
-            return None, None
-        return player['full_name'], df.head(n_games)
-    except Exception:
+    pid = player['id']
+    cur_season = nba_season_string_for_date(date.today())
+    seasons_try = [cur_season, prev_nba_season(cur_season)]
+    frames = []
+    for i, season in enumerate(seasons_try):
+        df_part = None
+        try:
+            log = playergamelog.PlayerGameLog(
+                player_id=pid,
+                season=season,
+                season_type_all_star='Regular Season',
+            )
+            df_part = log.get_data_frames()[0]
+            if df_part is not None and not df_part.empty:
+                frames.append(df_part)
+        except Exception:
+            pass
+        time.sleep(_SLEEP_PROP)
+        if i == 0 and df_part is not None and len(df_part) >= n_games:
+            break
+    if not frames:
         return None, None
+    combined = pd.concat(frames, ignore_index=True)
+    if 'GAME_DATE' in combined.columns:
+        combined = combined.copy()
+        combined['GAME_DATE'] = pd.to_datetime(combined['GAME_DATE'], errors='coerce')
+        combined = combined.sort_values('GAME_DATE', ascending=False)
+    if 'Game_ID' in combined.columns:
+        combined = combined.drop_duplicates(subset=['Game_ID'], keep='first')
+    return player['full_name'], combined.head(n_games)
 
 def minutes_trend(game_log):
     """Detect significant minutes reduction (injury/load management signal)."""
@@ -592,8 +727,10 @@ def prop_confidence(hit_rate):
     elif hit_rate >= 0.52: return "👀 LEAN",   "★☆☆"
     else:                  return "⚠️  RISKY", "☆☆☆"
 
-def analyze_player_props(team_abbr, opp_abbr, game_log_cache):
+def analyze_player_props(team_abbr, opp_abbr, game_log_cache, out_player_keys=None):
+    global PROPS_SKIPPED_INJURY
     props = []
+    out_player_keys = out_player_keys or set()
     opp_id     = team_lookup.get(opp_abbr, '')
     opp_def_pm = team_def_ratings.get(opp_id, 0.0)
     # Normalize: league avg pm ~0. Positive pm opp = their D is weak → boost props
@@ -605,10 +742,14 @@ def analyze_player_props(team_abbr, opp_abbr, game_log_cache):
         if key not in game_log_cache:
             full_name, log = get_player_recent_stats(name_frag)
             game_log_cache[key] = (full_name, log)
-            time.sleep(0.8)
+            time.sleep(_SLEEP_PROP)
         else:
             full_name, log = game_log_cache[key]
         if log is None or full_name is None:
+            continue
+
+        if player_listed_out(full_name, out_player_keys):
+            PROPS_SKIPPED_INJURY += 1
             continue
 
         min_recent, min_overall, min_flag = minutes_trend(log)
@@ -646,10 +787,13 @@ all_team_pairs    = [(away, home) for away, home in tonight]
 print(f"  Fetching player stats for {len(set(t for pair in all_team_pairs for t in pair))} teams...")
 for away_abbr, home_abbr in all_team_pairs:
     for abbr, opp in [(home_abbr, away_abbr), (away_abbr, home_abbr)]:
-        props = analyze_player_props(abbr, opp, game_log_cache)
+        props = analyze_player_props(abbr, opp, game_log_cache, OUT_PLAYER_KEYS)
         all_props_by_team[abbr] = props
         n = len([p for p in props if p['hit_rate'] >= 0.52])
+        PROPS_FETCH_LOG.append({"team": abbr, "opponent": opp, "viable_props": int(n)})
         print(f"  ✓ {abbr} (vs {opp}): {n} viable props")
+if PROPS_SKIPPED_INJURY:
+    print(f"  → Skipped {PROPS_SKIPPED_INJURY} player-prop rows (Out on injury report).")
 print()
 
 # ============================================================
@@ -942,6 +1086,7 @@ for i, m in enumerate(mixed[:5], 1):
     print()
 
 # Hot streak specials
+hot_parlays = []
 hot_props = [p for p in all_safe_props if '🔥' in p.get('trend','') or '📈' in p.get('trend','')]
 if hot_props:
     print("  ━━━ 🔥 HOT STREAK SPECIALS ━━━")
@@ -1008,6 +1153,7 @@ if all_safe_props:
     print()
 
 pool = [g for g in game_results if g['edge'] >= 0.05]
+best_team_parlay_data = None
 if len(pool) >= 2:
     best2 = sorted(
         [{'legs':c,'combined':parlay_prob([x['pick_prob'] for x in c]),
@@ -1018,6 +1164,20 @@ if len(pool) >= 2:
     if best2:
         tp  = best2[0]
         k   = kelly_bet(tp['combined'], prob_to_american(tp['combined']), BANKROLL)
+        best_team_parlay_data = {
+            'legs': [
+                {
+                    'pick_name': g['pick_name'],
+                    'pick_abbr': g['pick_abbr'],
+                    'pick_prob': float(g['pick_prob']),
+                    'pick_side': g['pick_side'],
+                }
+                for g in tp['legs']
+            ],
+            'combined': float(tp['combined']),
+            'payout': float(tp['payout']),
+            'kelly': float(k) if k else 0.0,
+        }
         lgs = "  +  ".join(g['pick_name'] for g in tp['legs'])
         print(f"  BEST TEAM PARLAY:")
         print(f"     {lgs}")
@@ -1062,3 +1222,367 @@ print("  6. Second run today is instant — model cached, no retraining")
 print("  7. Delete model_cache.pkl weekly to force a full retrain")
 print("  8. Never bet more than you can afford to lose")
 print()
+
+
+def _jf(x):
+    if x is None:
+        return None
+    if isinstance(x, (np.floating, float)):
+        return float(x)
+    if isinstance(x, (np.integer, int)):
+        return int(x)
+    if isinstance(x, np.bool_):
+        return bool(x)
+    return x
+
+
+def _serialize_prop(p):
+    return {
+        "player": p["player"],
+        "team": p["team"],
+        "label": p["label"],
+        "stat": p.get("stat"),
+        "threshold": _jf(p.get("threshold")),
+        "hit_rate": _jf(p["hit_rate"]),
+        "raw_hr": _jf(p["raw_hr"]),
+        "avg": _jf(p["avg"]),
+        "avg_recent": _jf(p["avg_recent"]),
+        "std": _jf(p["std"]) if p.get("std") == p.get("std") else None,
+        "n_games": _jf(p["n_games"]),
+        "trend": p.get("trend") or "",
+        "min_flag": p.get("min_flag") or "",
+        "opp_factor": _jf(p["opp_factor"]),
+        "min_recent": _jf(p.get("min_recent")),
+    }
+
+
+def _serialize_prop_row(p):
+    """Prop row with confidence stars (matches CLI TOP PROPS lines)."""
+    d = _serialize_prop(p)
+    conf, stars = prop_confidence(p["hit_rate"])
+    d["stars"] = stars
+    d["confidence_tier"] = conf
+    return d
+
+
+def _serialize_game(g):
+    return {
+        "home_abbr": g["home_abbr"],
+        "away_abbr": g["away_abbr"],
+        "home_name": g["home_name"],
+        "away_name": g["away_name"],
+        "prob_home": _jf(g["prob_home"]),
+        "prob_away": _jf(g["prob_away"]),
+        "pick_name": g["pick_name"],
+        "pick_abbr": g["pick_abbr"],
+        "pick_prob": _jf(g["pick_prob"]),
+        "pick_side": g["pick_side"],
+        "pick_odds": g["pick_odds"],
+        "edge": _jf(g["edge"]),
+        "confidence": g["confidence"],
+        "stars": g["stars"],
+        "kelly_amt": _jf(g["kelly_amt"]),
+        "props": [_serialize_prop(x) for x in g["props"]],
+    }
+
+
+def _serialize_game_full(g):
+    d = _serialize_game(g)
+    props = g["props"]
+    safe = [p for p in props if p["hit_rate"] >= 0.65 and not p["min_flag"]]
+    safe.sort(key=lambda x: x["hit_rate"], reverse=True)
+    risky = [p for p in props if 0.33 <= p["hit_rate"] < 0.50]
+    risky.sort(key=lambda x: x["hit_rate"], reverse=True)
+    seen = set()
+    mins = []
+    for p in props:
+        if p.get("min_flag") and p["player"] not in seen:
+            seen.add(p["player"])
+            mins.append({
+                "player": p["player"],
+                "min_recent": _jf(p.get("min_recent")),
+                "min_flag": p["min_flag"],
+            })
+    d["top_props"] = [_serialize_prop_row(x) for x in safe[:7]]
+    d["risky_props"] = [_serialize_prop(x) for x in risky[:4]]
+    d["minutes_warnings"] = mins[:5]
+    return d
+
+
+def _serialize_safe_parlay(p):
+    legs = []
+    for leg in p["legs"]:
+        conf, stars = prop_confidence(leg["hit_rate"])
+        legs.append({
+            "player": leg["player"],
+            "label": leg["label"],
+            "hit_rate": _jf(leg["hit_rate"]),
+            "trend": leg.get("trend") or "",
+            "stars": stars,
+            "confidence": conf,
+        })
+    ko = prob_to_american(p["combined"])
+    return {
+        "n": p["n"],
+        "combined": _jf(p["combined"]),
+        "payout": _jf(p["payout"]),
+        "implied_american": ko,
+        "kelly": _jf(kelly_bet(p["combined"], ko, BANKROLL)),
+        "legs": legs,
+    }
+
+
+def _serialize_risky_parlay(p):
+    return {
+        "n": p["n"],
+        "combined": _jf(p["combined"]),
+        "payout": _jf(p["payout"]),
+        "implied_american": prob_to_american(p["combined"]),
+        "legs": [
+            {
+                "player": leg["player"],
+                "label": leg["label"],
+                "hit_rate": _jf(leg["hit_rate"]),
+                "trend": leg.get("trend") or "",
+                "avg": _jf(leg["avg"]),
+            }
+            for leg in p["legs"]
+        ],
+    }
+
+
+def _serialize_hot_parlay(p):
+    return {
+        "n": p["n"],
+        "combined": _jf(p["combined"]),
+        "payout": _jf(p["payout"]),
+        "implied_american": prob_to_american(p["combined"]),
+        "legs": [
+            {
+                "player": leg["player"],
+                "label": leg["label"],
+                "hit_rate": _jf(leg["hit_rate"]),
+                "trend": leg.get("trend") or "",
+                "avg": _jf(leg["avg"]),
+                "avg_recent": _jf(leg["avg_recent"]),
+            }
+            for leg in p["legs"]
+        ],
+    }
+
+
+def _serialize_mixed_with_kelly(m):
+    out = _serialize_mixed(m)
+    ko = prob_to_american(m["combined"])
+    out["kelly"] = _jf(kelly_bet(m["combined"], ko, BANKROLL))
+    out["implied_american"] = ko
+    return out
+
+
+def _serialize_prop_parlay(p):
+    return {
+        "n": p["n"],
+        "combined": _jf(p["combined"]),
+        "payout": _jf(p["payout"]),
+        "legs": [
+            {
+                "player": leg["player"],
+                "label": leg["label"],
+                "hit_rate": _jf(leg["hit_rate"]),
+                "trend": leg.get("trend") or "",
+            }
+            for leg in p["legs"]
+        ],
+    }
+
+
+def _serialize_mixed(m):
+    g = m["game"]
+    out = {
+        "n": m["n"],
+        "combined": _jf(m["combined"]),
+        "payout": _jf(m["payout"]),
+        "team_pick": {
+            "pick_name": g["pick_name"],
+            "pick_abbr": g["pick_abbr"],
+            "pick_prob": _jf(g["pick_prob"]),
+            "pick_side": g["pick_side"],
+            "stars": g["stars"],
+        },
+        "prop": _serialize_prop(m["prop"]),
+    }
+    if "prop2" in m:
+        out["prop2"] = _serialize_prop(m["prop2"])
+    return out
+
+
+if _JSON_MODE:
+    try:
+        sys.stdout.close()
+    except Exception:
+        pass
+    sys.stdout = _real_stdout
+
+    strong = [g for g in game_results if g["edge"] >= 0.15]
+    good = [g for g in game_results if 0.09 <= g["edge"] < 0.15]
+    lean = [g for g in game_results if 0.05 <= g["edge"] < 0.09]
+    skip = [g for g in game_results if g["edge"] < 0.05]
+    total_kelly = sum(float(g["kelly_amt"]) for g in strong + good)
+
+    best_prop = None
+    if all_safe_props:
+        bp = max(all_safe_props, key=lambda x: x["hit_rate"])
+        best_prop = {
+            "player": bp["player"],
+            "label": bp["label"],
+            "hit_rate": _jf(bp["hit_rate"]),
+            "avg": _jf(bp["avg"]),
+            "n_games": _jf(bp["n_games"]),
+            "trend": bp.get("trend") or "",
+        }
+
+    calibration_bins = []
+    for lo, hi in [(0.5, 0.55), (0.55, 0.60), (0.60, 0.65), (0.65, 0.70), (0.70, 1.0)]:
+        mask = (probs >= lo) & (probs < hi)
+        if mask.sum() > 10:
+            calibration_bins.append({
+                "range": f"{lo:.0%}–{hi:.0%}",
+                "actual_win_rate": float(y_test[mask].mean()),
+                "n_games": int(mask.sum()),
+            })
+
+    cr_dict = classification_report(
+        y_test, preds, target_names=["Away Win", "Home Win"],
+        output_dict=True, zero_division=0,
+    )
+
+    best_prop_kelly = 0.0
+    if safe_parlays:
+        best_prop_kelly = float(
+            kelly_bet(
+                safe_parlays[0]["combined"],
+                prob_to_american(safe_parlays[0]["combined"]),
+                BANKROLL,
+            )
+        )
+
+    _chart = os.path.join(os.path.dirname(os.path.abspath(__file__)), "feature_importance.png")
+    how_lines = [
+        "Set BANKROLL in nba_predictor.py to your actual bankroll.",
+        "Copy STRONG BET + Kelly amounts to your sportsbook.",
+        "SAFE PROP PARLAY #1 = steady-value template.",
+        "Cap RISKY PARLAYS at $10–20 max.",
+        "HOT STREAK parlays = players trending up vs season average.",
+        "Players listed Out (ESPN injury feed) are removed from props and parlays.",
+        "Second run the same day is faster when model cache hits.",
+        "Delete model_cache.pkl weekly if you want a full retrain.",
+        "Never bet more than you can afford to lose.",
+    ]
+
+    report = {
+        "ok": True,
+        "brand": "RoliBot NBA",
+        "generated_at": date.today().isoformat(),
+        "bankroll": float(BANKROLL),
+        "kelly_fraction": float(KELLY_FRACTION),
+        "max_bet_pct": float(MAX_BET_PCT),
+        "how_to_use": how_lines,
+        "pipeline": {
+            "season_pull": SEASON_PULL_LOG,
+            "current_nba_season": _current_season,
+            "raw_season_rows": int(games.shape[0]),
+            "clean_merged_games": int(len(merged)),
+            "home_win_rate_merged": _jf(float(merged["HOME_WIN"].mean())),
+            "date_from": str(merged["GAME_DATE_HOME"].min().date()),
+            "date_to": str(merged["GAME_DATE_HOME"].max().date()),
+            "train_games": int(len(X_train)),
+            "test_games": int(len(X_test)),
+            "schedule_tonight": int(len(tonight)),
+            "props_fetch": PROPS_FETCH_LOG,
+            "props_teams_fetched": int(len(set(t for pair in all_team_pairs for t in pair))),
+            "props_skipped_injury": int(PROPS_SKIPPED_INJURY),
+            "injury_report": {
+                "source": INJURY_REPORT_META.get("source"),
+                "fetched_ok": bool(INJURY_REPORT_META.get("fetched_ok")),
+                "n_out": int(INJURY_REPORT_META.get("n_out", 0)),
+                "error": INJURY_REPORT_META.get("error"),
+                "out_players": (INJURY_REPORT_META.get("out_players") or [])[:50],
+            },
+        },
+        "training": {
+            "xgb_eval_log": XGB_EVAL_LOG,
+            "from_cache": bool(cache_valid),
+            "feature_importance_saved": os.path.isfile(_chart),
+            "feature_importance_path": "nba_bot/feature_importance.png" if os.path.isfile(_chart) else None,
+        },
+        "run_meta": {
+            "cache_line": "HIT — skipped retraining" if cache_valid else "MISS — retrained & saved",
+            "games_predicted_tonight": len(game_results),
+            "breakeven_note": "~52.4% implied win rate vs standard -110 sides",
+        },
+        "model": {
+            "name": "Ensemble (XGBoost 60% + Random Forest 40%)",
+            "accuracy": _jf(acc),
+            "logloss": _jf(ll),
+            "edge_vs_book_pp": _jf((acc - 0.524) * 100),
+            "n_features": len(feature_cols),
+            "n_train_games": int(len(X_train)),
+            "cache_hit": bool(cache_valid),
+        },
+        "evaluation": {
+            "classification_report": cr_dict,
+            "calibration_bins": calibration_bins,
+        },
+        "games": [_serialize_game_full(g) for g in game_results],
+        "bet_slip": {
+            "strong": [_serialize_game_full(g) for g in strong],
+            "good": [_serialize_game_full(g) for g in good],
+            "lean": [_serialize_game_full(g) for g in lean],
+            "skip": [
+                {
+                    "home_name": g["home_name"],
+                    "away_name": g["away_name"],
+                    "home_abbr": g["home_abbr"],
+                    "away_abbr": g["away_abbr"],
+                }
+                for g in skip
+            ],
+            "total_kelly": _jf(total_kelly),
+            "total_kelly_pct_bankroll": _jf(total_kelly / BANKROLL) if BANKROLL else 0.0,
+        },
+        "parlays": {
+            "safe_props": [_serialize_safe_parlay(p) for p in safe_parlays],
+            "risky_props": [_serialize_risky_parlay(p) for p in risky_parlays],
+            "mixed": [_serialize_mixed_with_kelly(m) for m in mixed[:5]],
+            "hot": [_serialize_hot_parlay(p) for p in hot_parlays],
+            "best_team": best_team_parlay_data,
+            "best_safe_prop": _serialize_safe_parlay(safe_parlays[0]) if safe_parlays else None,
+            "best_risky_prop": _serialize_risky_parlay(risky_parlays[0]) if risky_parlays else None,
+        },
+        "highlights": {
+            "best_prop_parlay_kelly": _jf(best_prop_kelly),
+        },
+        "props_summary": {
+            "n_safe": len(all_safe_props),
+            "n_risky": len(all_risky_props),
+            "best_prop": best_prop,
+        },
+        "disclaimer": "For entertainment only. Not financial advice. Parlay probabilities assume independence.",
+    }
+
+    def _json_default(o):
+        if isinstance(o, (np.integer,)):
+            return int(o)
+        if isinstance(o, (np.floating,)):
+            return float(o)
+        if isinstance(o, np.ndarray):
+            return o.tolist()
+        raise TypeError(type(o))
+
+    payload = json.dumps(report, ensure_ascii=False, default=_json_default)
+    _outp = os.environ.get("ROLI_JSON_OUT")
+    if _outp:
+        with open(_outp, "w", encoding="utf-8") as _f:
+            _f.write(payload)
+    else:
+        print(payload)

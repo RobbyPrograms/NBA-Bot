@@ -13,3 +13,6 @@ build/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.next/
+node_modules/
+.rolibot_report.json
