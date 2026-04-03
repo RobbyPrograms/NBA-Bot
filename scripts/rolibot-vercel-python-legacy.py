@@ -1,4 +1,12 @@
-"""Vercel Python serverless: run RoliBot NBA pipeline and return JSON."""
+"""
+Legacy Vercel Python serverless handler (same as former api/rolibot.py).
+
+Vercel often stalls or fails while installing xgboost/scikit-learn for builds.
+The app now serves /api/rolibot from Next.js (app/api/rolibot/route.ts).
+
+To run the full pipeline on Vercel Python again: copy this file to api/rolibot.py,
+restore vercel.json functions config, and ensure requirements.txt installs on CI.
+"""
 
 from datetime import datetime, timedelta, time
 from http.server import BaseHTTPRequestHandler
@@ -32,17 +40,6 @@ def _seconds_until_next_rollover(tz_name: str, hour: int, minute: int) -> int:
 
 
 def _shared_cache_s_maxage() -> int | None:
-    """
-    CDN `s-maxage` in seconds, or None = do not cache at the edge.
-
-    - ROLI_S_MAXAGE=0  → no shared cache (every request runs the pipeline).
-    - ROLI_S_MAXAGE=N  → fixed N seconds (overrides midnight logic).
-    - Production/preview on Vercel → cache until next rollover in ROLI_ROLLOVER_TZ
-      (default America/New_York), time ROLI_ROLLOVER_HOUR:ROLI_ROLLOVER_MINUTE (default 0:0 = midnight).
-    - Local / vercel dev → no shared cache unless ROLI_S_MAXAGE is set positive.
-
-    No stale-while-revalidate: after midnight the previous response must not linger past TTL.
-    """
     override = os.environ.get("ROLI_S_MAXAGE", "").strip()
     if override == "0":
         return None
@@ -121,7 +118,6 @@ class handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json; charset=utf-8")
         sm = _shared_cache_s_maxage()
         if sm is not None:
-            # max-age=0: browsers revalidate often; s-maxage: CDN serves one copy for everyone until TTL.
             self.send_header("Cache-Control", f"public, max-age=0, s-maxage={sm}")
         else:
             self.send_header("Cache-Control", "no-store, max-age=0")
