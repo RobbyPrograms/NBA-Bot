@@ -290,27 +290,23 @@ export default function Page() {
     if (useMock) {
       setData(mockReport);
       setUsedMock(true);
+      setError(null);
       setLoading(false);
       return;
     }
     try {
       const res = await fetch(API_PATH);
-      if (res.status === 404) {
-        setData(mockReport);
-        setUsedMock(true);
-        setLoading(false);
-        return;
-      }
       const json = (await res.json()) as RolibotReport & { error?: string };
       if (!res.ok || json.ok === false) {
         throw new Error(json.error || `HTTP ${res.status}`);
       }
       setData(json);
       setUsedMock(false);
+      setError(null);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to load");
-      setData(mockReport);
-      setUsedMock(true);
+      setData(null);
+      setUsedMock(false);
     } finally {
       setLoading(false);
     }
@@ -360,22 +356,37 @@ export default function Page() {
           </div>
         )}
 
+        {!loading && !r && error && (
+          <Card className="w-full border-amber-500/40 bg-[var(--card-inner)] p-6">
+            <p className="font-semibold text-[var(--text)]">Could not load live report</p>
+            <p className="mt-2 text-sm text-[var(--muted)]">{error}</p>
+            <p className="mt-4 text-sm text-[var(--muted)]">
+              Point <code className="font-mono text-[var(--accent)]">ROLI_REPORT_URL</code> or{" "}
+              <code className="font-mono text-[var(--accent)]">ROLI_BACKEND_URL</code> at JSON from{" "}
+              <code className="font-mono text-[var(--text)]">nba_predictor.py</code>, or open with{" "}
+              <code className="font-mono text-[var(--text)]">?demo=1</code> for a static UI sample only.
+            </p>
+          </Card>
+        )}
+
         {!loading && r && (
           <>
-            {(error || usedMock) && (
+            {usedMock && (
               <Card className="w-full border-[var(--accent-2)]/30 bg-[var(--card-inner)] p-4">
                 <p className="text-sm text-[var(--muted)]">
-                  {error && (
-                    <>
-                      <span className="font-semibold text-[var(--text)]">API error.</span> {error} Showing demo data.
-                    </>
-                  )}
-                  {!error && usedMock && (
-                    <span>
-                      Demo snapshot loaded. Deploy with <code className="font-mono text-[var(--accent)]">/api/rolibot</code> for
-                      live runs.
-                    </span>
-                  )}
+                  <span className="font-semibold text-[var(--text)]">Demo mode</span> — static sample only (
+                  <code className="font-mono text-[var(--accent)]">?demo=1</code>). Not live data.
+                </p>
+              </Card>
+            )}
+
+            {!usedMock && r.brand.includes("local demo") && (
+              <Card className="w-full border-[var(--border)] bg-[var(--card-inner)] p-4">
+                <p className="text-sm text-[var(--muted)]">
+                  <span className="font-semibold text-[var(--text)]">Local dev</span> —{" "}
+                  <code className="font-mono text-[var(--accent)]">/api/rolibot</code> is serving the bundled sample JSON
+                  because <code className="font-mono">ROLI_REPORT_URL</code> /{" "}
+                  <code className="font-mono">ROLI_BACKEND_URL</code> are unset. Set them for real pipeline output.
                 </p>
               </Card>
             )}
@@ -439,8 +450,14 @@ export default function Page() {
             {pipe && (
               <section className="w-full space-y-4">
                 <SectionHeading>Tonight&apos;s schedule</SectionHeading>
+                <p className="text-sm text-[var(--muted)]">
+                  Scoreboard date follows NBA game-day (US Eastern by default), not your PC clock — see slate date below.
+                </p>
                 <div className="grid w-full grid-cols-2 gap-3 lg:grid-cols-4">
                   <StatTile label="Games on slate" value={String(pipe.schedule_tonight)} />
+                  {pipe.slate_date ? (
+                    <StatTile label="Slate date (ET)" value={pipe.slate_date} />
+                  ) : null}
                 </div>
               </section>
             )}
@@ -477,11 +494,17 @@ export default function Page() {
 
             <section className="w-full space-y-4">
               <SectionHeading>Game predictions</SectionHeading>
-              <div className="grid w-full grid-cols-1 gap-5 lg:grid-cols-2">
-                {r.games.map((g) => (
-                  <GamePredictionCard key={`${g.home_abbr}-${g.away_abbr}`} g={g} />
-                ))}
-              </div>
+              {r.games.length === 0 ? (
+                <p className="text-sm text-[var(--muted)]">
+                  No games on the slate for this run (off day or schedule not returned).
+                </p>
+              ) : (
+                <div className="grid w-full grid-cols-1 gap-5 lg:grid-cols-2">
+                  {r.games.map((g) => (
+                    <GamePredictionCard key={`${g.home_abbr}-${g.away_abbr}`} g={g} />
+                  ))}
+                </div>
+              )}
             </section>
 
             <section className="w-full space-y-4">

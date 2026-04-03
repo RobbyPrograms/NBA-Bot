@@ -155,6 +155,9 @@ export interface PipelineStats {
   train_games: number;
   test_games: number;
   schedule_tonight: number;
+  /** YYYY-MM-DD passed to NBA scoreboard (Eastern game-day by default) */
+  slate_date?: string;
+  slate_timezone?: string;
   props_fetch?: PropsFetchRow[];
   props_teams_fetched?: number;
   props_skipped_injury?: number;

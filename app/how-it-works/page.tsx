@@ -130,8 +130,7 @@ export default function HowItWorksPage() {
         </section>
 
         <p className="pb-8 text-center text-sm text-[var(--muted)]">
-          — Built by <span className="font-semibold text-[var(--text)]">Robby Rolison</span> · custom AI / quant-style
-          NBA stack —
+          — Built by <span className="font-semibold text-[var(--text)]">Robby Rolison</span>
         </p>
       </main>
     </div>

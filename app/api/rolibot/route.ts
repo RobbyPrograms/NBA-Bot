@@ -3,6 +3,9 @@ import { mockReport } from "@/lib/mock-report";
 
 export const runtime = "nodejs";
 
+const NO_UPSTREAM_MSG =
+  "Live report not configured. Set ROLI_REPORT_URL or ROLI_BACKEND_URL to your hosted predictor JSON (see project README).";
+
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, OPTIONS",
@@ -117,11 +120,24 @@ export async function GET() {
     );
   }
 
-  const body = {
-    ...mockReport,
-    generated_at: new Date().toISOString(),
-  };
-  return NextResponse.json(body, {
-    headers: { ...corsHeaders, ...cacheControlHeaders() },
-  });
+  const devOrDemoFallback =
+    process.env.NODE_ENV === "development" || process.env.ROLI_DEMO_FALLBACK === "1";
+  if (devOrDemoFallback) {
+    const body = {
+      ...mockReport,
+      generated_at: new Date().toISOString(),
+      brand: `${mockReport.brand} · local demo`,
+    };
+    return NextResponse.json(body, {
+      headers: { ...corsHeaders, ...cacheControlHeaders() },
+    });
+  }
+
+  return NextResponse.json(
+    { ok: false, error: NO_UPSTREAM_MSG },
+    {
+      status: 503,
+      headers: { ...corsHeaders, "Cache-Control": "no-store, max-age=0" },
+    }
+  );
 }

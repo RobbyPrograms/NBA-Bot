@@ -4,6 +4,7 @@
 #  Opponent-Adjusted Props  •  Hot/Cold Streaks  •  Caching
 # ============================================================
 
+import difflib
 import os, sys, time, warnings, itertools, pickle, hashlib, json, urllib.request
 warnings.filterwarnings('ignore')
 
@@ -20,7 +21,12 @@ if hasattr(sys.stdout, "reconfigure"):
     except Exception:
         pass
 
-from nba_api.stats.endpoints import leaguegamefinder, scoreboardv2, playergamelog
+from nba_api.stats.endpoints import (
+    commonteamroster,
+    leaguegamefinder,
+    playergamelog,
+    scoreboardv2,
+)
 from nba_api.stats.static   import teams as nba_teams_static, players as nba_players_static
 import pandas as pd
 import numpy as np
@@ -33,7 +39,47 @@ try:
     USE_FROZEN = True
 except ImportError:
     USE_FROZEN = False
-from datetime import date
+from collections import defaultdict
+from datetime import date, datetime
+
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    ZoneInfo = None  # type: ignore
+
+
+def roli_slate_date():
+    """
+    Calendar date for scoreboard + 'tonight' (NBA uses US Eastern for game days).
+    Fixes 'still on yesterday' when local PC timezone is behind ET after midnight ET.
+
+    ROLI_GAME_DATE=YYYY-MM-DD — force slate (backtest / cron at known time).
+    ROLI_SCOREBOARD_TZ — IANA tz for 'today' (default America/New_York).
+    """
+    override = (os.environ.get("ROLI_GAME_DATE") or "").strip()
+    if len(override) >= 10:
+        try:
+            return datetime.strptime(override[:10], "%Y-%m-%d").date()
+        except ValueError:
+            pass
+    tz_name = (os.environ.get("ROLI_SCOREBOARD_TZ") or "America/New_York").strip()
+    if ZoneInfo is not None:
+        try:
+            return datetime.now(ZoneInfo(tz_name)).date()
+        except Exception:
+            pass
+    return date.today()
+
+
+def roli_generated_at_iso():
+    """Wall-clock time of this run in slate timezone (for JSON generated_at)."""
+    tzn = os.environ.get("ROLI_SCOREBOARD_TZ") or "America/New_York"
+    if ZoneInfo is not None:
+        try:
+            return datetime.now(ZoneInfo(tzn)).isoformat(timespec="seconds")
+        except Exception:
+            pass
+    return datetime.now().isoformat(timespec="seconds")
 
 # ─────────────────────────────────────────────────────────────
 #  CONFIG  — edit these to match your situation
@@ -50,6 +96,10 @@ PROP_GAMES_BACK   = 20      # Recent games to use for prop analysis
 _SLEEP_SEASON = 0.35 if _IS_SERVERLESS else 2
 _SLEEP_RETRY  = 0.8 if _IS_SERVERLESS else 3
 _SLEEP_PROP   = 0.15 if _IS_SERVERLESS else 0.8
+_SLEEP_ROSTER = 0.45 if _IS_SERVERLESS else 0.85
+MAX_ROSTER_PLAYERS = 14
+MIN_AVG_MINUTES_FOR_PROPS = 10.5
+PROP_RAW_HR_DEDUPE_EPS = 0.04
 
 # Populated during run for JSON / UI parity with CLI
 SEASON_PULL_LOG = []
@@ -152,10 +202,77 @@ def normalize_injury_display_name(name):
     return " ".join(n.split())
 
 
+def _espn_injury_excluded_statuses():
+    """
+    Statuses to treat as unavailable for props.
+    Default includes questionable / day-to-day / GTD so borderline injuries do not get prop lines.
+    Tighten with ROLI_ESPN_INJURY_STATUSES=out,doubtful,suspended
+    """
+    raw = (
+        os.environ.get("ROLI_ESPN_INJURY_STATUSES")
+        or "out,doubtful,suspended,questionable,day-to-day,game time decision"
+    ).strip().lower()
+    parts = [p.strip() for p in raw.split(",") if p.strip()]
+    return set(parts) if parts else {
+        "out",
+        "doubtful",
+        "suspended",
+        "questionable",
+        "day-to-day",
+        "game time decision",
+    }
+
+
+def _espn_row_status_tokens(row):
+    """Collect comparable status strings from ESPN injury row (top-level + fantasyStatus)."""
+    found = set()
+    for raw in (row.get("status"),):
+        if not raw:
+            continue
+        s = str(raw).strip().lower().replace("-", " ")
+        found.add(s)
+        if "/" in s:
+            found.add(s.split("/")[0].strip())
+    fs = row.get("fantasyStatus")
+    if isinstance(fs, dict):
+        for k in ("abbreviation", "description", "displayDescription"):
+            v = fs.get(k)
+            if v:
+                found.add(str(v).strip().lower().replace("-", " "))
+    return found
+
+
+def _espn_row_is_excluded(row, excluded):
+    tokens = _espn_row_status_tokens(row)
+    if tokens & excluded:
+        return True
+    for t in tokens:
+        if t in excluded:
+            return True
+    return False
+
+
+def _espn_athlete_name_keys(ath):
+    """Normalized lookup keys for one athlete (display, first+last, shortName)."""
+    keys = set()
+    if not ath:
+        return keys
+    disp = (ath.get("displayName") or "").strip()
+    if disp:
+        keys.add(normalize_injury_display_name(disp))
+    fn = (ath.get("firstName") or "").strip()
+    ln = (ath.get("lastName") or "").strip()
+    if fn and ln:
+        keys.add(normalize_injury_display_name(f"{fn} {ln}"))
+    sn = (ath.get("shortName") or "").strip()
+    if sn:
+        keys.add(normalize_injury_display_name(sn))
+    return {k for k in keys if k}
+
+
 def fetch_espn_out_players():
     """
-    Players listed as Out on ESPN's public injury feed (no API key).
-    Returns (set of normalized names, meta dict). On failure returns (empty set, meta with error).
+    ESPN injuries feed (no API key). Uses status + fantasyStatus; adds all athlete name variants to the set.
     """
     url = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/injuries"
     req = urllib.request.Request(
@@ -171,29 +288,63 @@ def fetch_espn_out_players():
         meta["error"] = str(e)[:200]
         return out_set, meta
 
+    excluded = _espn_injury_excluded_statuses()
     for team_block in payload.get("injuries") or []:
         team_name = team_block.get("displayName") or ""
         for row in team_block.get("injuries") or []:
-            if (row.get("status") or "").strip().lower() != "out":
+            if not _espn_row_is_excluded(row, excluded):
                 continue
             ath = row.get("athlete") or {}
             disp = (ath.get("displayName") or "").strip()
             if not disp:
                 continue
-            key = normalize_injury_display_name(disp)
-            out_set.add(key)
+            st = row.get("status") or ""
+            for nk in _espn_athlete_name_keys(ath):
+                out_set.add(nk)
             meta["out_players"].append(
-                {"player": disp, "team": team_name, "status": row.get("status")}
+                {"player": disp, "team": team_name, "status": st}
             )
     meta["fetched_ok"] = True
-    meta["n_out"] = len(out_set)
+    meta["n_out"] = len(meta["out_players"])
     return out_set, meta
 
 
 def player_listed_out(full_name, out_normalized_set):
+    """
+    True if full_name matches ESPN excluded list (normalized exact, fuzzy string, or same last name + first initial).
+    """
     if not full_name or not out_normalized_set:
         return False
-    return normalize_injury_display_name(full_name) in out_normalized_set
+    fn = normalize_injury_display_name(full_name)
+    if fn in out_normalized_set:
+        return True
+    for o in out_normalized_set:
+        if difflib.SequenceMatcher(None, fn, o).ratio() >= 0.86:
+            return True
+    parts = fn.split()
+    if len(parts) >= 2:
+        first0, last = parts[0], parts[-1]
+        for o in out_normalized_set:
+            op = o.split()
+            if len(op) >= 2 and op[-1] == last and op[0][:1] == first0[:1]:
+                return True
+    return False
+
+
+def _prop_matchup_frozen(p):
+    return frozenset({str(p["team"]).strip().upper(), str(p["opp"]).strip().upper()})
+
+
+def _log_majority_plays_for_team(log, team_abbr, n_check=7, min_matches=3):
+    """Require most recent games to be for this NBA team (filters stale logs after trades)."""
+    if log is None or log.empty or "TEAM_ABBREVIATION" not in log.columns:
+        return True
+    t = str(team_abbr).strip().upper()
+    head = log["TEAM_ABBREVIATION"].head(n_check)
+    col = head.astype(str).str.strip().str.upper()
+    n_ok = int((col == t).sum())
+    need = min(min_matches, len(col))
+    return n_ok >= need if need else True
 
 # ─────────────────────────────────────────────────────────────
 #  BANNER
@@ -209,7 +360,7 @@ print()
 #  PHASE 1 — PULL RAW DATA
 # ============================================================
 print("━" * 60)
-_run_date = date.today()
+_run_date = roli_slate_date()
 _current_season = nba_season_string_for_date(_run_date)
 all_seasons = nba_seasons_from_2018_through(_run_date)
 print(f" PHASE 1 — Pulling NBA game data ({len(all_seasons)} seasons through {_current_season})...")
@@ -543,6 +694,10 @@ print()
 print("━" * 60)
 print(" PHASE 6 — Fetching tonight's real NBA schedule...")
 print("━" * 60)
+print(
+    f"  Slate calendar date: {_run_date}  (tz: {os.environ.get('ROLI_SCOREBOARD_TZ') or 'America/New_York'}; "
+    f"override with ROLI_GAME_DATE=YYYY-MM-DD)"
+)
 
 team_list        = nba_teams_static.get_teams()
 team_lookup      = {t['abbreviation']: t['id'] for t in team_list}
@@ -561,7 +716,7 @@ team_def_ratings = build_team_def_ratings()
 
 def get_tonights_games():
     try:
-        sb    = scoreboardv2.ScoreboardV2(game_date=date.today().strftime('%Y-%m-%d'))
+        sb    = scoreboardv2.ScoreboardV2(game_date=_run_date.strftime('%Y-%m-%d'))
         ginfo = sb.game_header.get_data_frame()
         if ginfo.empty:
             return []
@@ -580,8 +735,7 @@ tonight = get_tonights_games()
 if tonight:
     print(f"  ✓ Found {len(tonight)} games tonight automatically\n")
 else:
-    print("  ! Auto-fetch returned no games. Using sample matchups.\n")
-    tonight = [('BOS','LAL'),('GSW','MIA'),('DEN','NYK'),('MIL','PHX'),('DAL','OKC')]
+    print("  ! No games on the NBA schedule for this date — props & slate outputs will be empty.\n")
 
 # ============================================================
 #  PHASE 6B — PLAYER PROP ENGINE
@@ -592,7 +746,10 @@ print("━" * 60)
 
 OUT_PLAYER_KEYS, INJURY_REPORT_META = fetch_espn_out_players()
 if INJURY_REPORT_META.get("fetched_ok"):
-    print(f"  ✓ Injury report (ESPN): {INJURY_REPORT_META.get('n_out', 0)} players listed Out — excluded from props & parlays")
+    print(
+        f"  ✓ Injury report (ESPN): {INJURY_REPORT_META.get('n_out', 0)} players "
+        f"match excluded statuses — skipped in props & parlays"
+    )
 elif INJURY_REPORT_META.get("error"):
     print(f"  ! Injury report unavailable ({INJURY_REPORT_META['error'][:80]}) — props not injury-filtered")
 else:
@@ -607,57 +764,19 @@ PROP_THRESHOLDS = {
     'BLK':  [1, 2, 3],
 }
 
-KEY_PLAYERS_BY_TEAM = {
-    'LAL': ['LeBron','Davis','Reaves','Hachimura'],
-    'GSW': ['Curry','Green','Kuminga','Wiggins'],
-    'BOS': ['Tatum','Brown','Holiday','Porzingis'],
-    'DEN': ['Jokic','Murray','Porter','Gordon'],
-    'MIL': ['Giannis','Lillard','Portis','Middleton'],
-    'PHX': ['Durant','Booker','Beal','Nurkic'],
-    'NYK': ['Brunson','Towns','Hart','Anunoby'],
-    'MIA': ['Butler','Adebayo','Herro','Love'],
-    'OKC': ['Gilgeous','Dort','Holmgren','Williams'],
-    'DAL': ['Doncic','Irving','Gafford','Washington'],
-    'CLE': ['Mitchell','Mobley','Garland','Allen'],
-    'LAC': ['Harden','Zubac','Powell','Mann'],
-    'SAS': ['Wembanyama','Johnson','Castle','Vassell'],
-    'MIN': ['Edwards','Gobert','Conley','McDaniels'],
-    'NOP': ['Williamson','Ingram','Valanciunas','Murphy'],
-    'POR': ['Simons','Anfernee','Smith','Sharpe'],
-    'CHA': ['LaMelo','Miles Bridges','Richards','Washington'],
-    'DET': ['Cunningham','Stewart','Duren','Harris'],
-    'IND': ['Haliburton','Siakam','Turner','Nembhard'],
-    'ATL': ['Young','Murray','Okongwu','Hunter'],
-    'CHI': ['LaVine','DeRozan','Vucevic','Williams'],
-    'TOR': ['Scottie','Quickley','Boucher','Poeltl'],
-    'WAS': ['Poole','Kuzma','Gafford','Kispert'],
-    'ORL': ['Paolo','Franz','Fultz','Harris'],
-    'SAC': ['Fox','Sabonis','Monk','Huerter'],
-    'UTA': ['Lauri','Keyonte','Sexton','Clarkson'],
-    'HOU': ['Green','Sengun','Thompson','Jabari'],
-    'MEM': ['Morant','Jackson','Smart','Konchar'],
-}
-
-def get_player_recent_stats(name_frag, n_games=PROP_GAMES_BACK):
+def _concat_player_season_logs(player_id, n_games=PROP_GAMES_BACK):
     """
     Pull last n_games from the current NBA season via nba_api; if the log is short (early season),
     prepend the previous season's games so thresholds stay meaningful.
     """
-    all_players = nba_players_static.get_players()
-    matches = [p for p in all_players
-               if name_frag.lower() in p['full_name'].lower() and p['is_active']]
-    if not matches:
-        return None, None
-    player = matches[0]
-    pid = player['id']
-    cur_season = nba_season_string_for_date(date.today())
+    cur_season = nba_season_string_for_date(_run_date)
     seasons_try = [cur_season, prev_nba_season(cur_season)]
     frames = []
     for i, season in enumerate(seasons_try):
         df_part = None
         try:
             log = playergamelog.PlayerGameLog(
-                player_id=pid,
+                player_id=int(player_id),
                 season=season,
                 season_type_all_star='Regular Season',
             )
@@ -670,7 +789,7 @@ def get_player_recent_stats(name_frag, n_games=PROP_GAMES_BACK):
         if i == 0 and df_part is not None and len(df_part) >= n_games:
             break
     if not frames:
-        return None, None
+        return None
     combined = pd.concat(frames, ignore_index=True)
     if 'GAME_DATE' in combined.columns:
         combined = combined.copy()
@@ -678,7 +797,116 @@ def get_player_recent_stats(name_frag, n_games=PROP_GAMES_BACK):
         combined = combined.sort_values('GAME_DATE', ascending=False)
     if 'Game_ID' in combined.columns:
         combined = combined.drop_duplicates(subset=['Game_ID'], keep='first')
-    return player['full_name'], combined.head(n_games)
+    return combined.head(n_games)
+
+
+def get_player_recent_stats(name_frag, n_games=PROP_GAMES_BACK):
+    """Fallback name-fragment lookup (ambiguous if multiple matches). Prefer roster + player id."""
+    all_players = nba_players_static.get_players()
+    matches = [
+        p
+        for p in all_players
+        if name_frag.lower() in p['full_name'].lower() and p['is_active']
+    ]
+    if not matches:
+        return None, None
+    matches.sort(key=lambda p: (-len(p['full_name']), p['full_name']))
+    player = matches[0]
+    log = _concat_player_season_logs(player['id'], n_games)
+    if log is None:
+        return None, None
+    return player['full_name'], log
+
+
+def get_player_recent_stats_by_id(player_id, roster_name=None, n_games=PROP_GAMES_BACK):
+    log = _concat_player_season_logs(player_id, n_games)
+    if log is None:
+        return None, None
+    full_name = roster_name
+    if not full_name:
+        for p in nba_players_static.get_players():
+            if int(p['id']) == int(player_id):
+                full_name = p['full_name']
+                break
+    return full_name, log
+
+
+def build_team_roster_cache(team_abbrs, season_str):
+    """
+    Current-season NBA.com rosters only (CommonTeamRoster). No hardcoded player lists.
+    """
+    cache = {}
+    for abbr in sorted(team_abbrs):
+        tid = team_lookup.get(abbr)
+        entries = []
+        if tid:
+            try:
+                ctr = commonteamroster.CommonTeamRoster(
+                    team_id=int(tid), season=season_str
+                )
+                df = ctr.common_team_roster.get_data_frame()
+                if df is not None and not df.empty and 'PLAYER_ID' in df.columns:
+                    for _, row in df.iterrows():
+                        try:
+                            pid = int(row['PLAYER_ID'])
+                        except (TypeError, ValueError):
+                            continue
+                        name = row.get('PLAYER')
+                        if name is None or (isinstance(name, float) and pd.isna(name)):
+                            continue
+                        name = str(name).strip()
+                        if name:
+                            entries.append({'id': pid, 'name': name})
+                    entries = entries[:MAX_ROSTER_PLAYERS]
+            except Exception:
+                entries = []
+        if not entries and tid:
+            print(f"  ! Roster fetch failed or empty for {abbr} — skipping props for that team.")
+        cache[abbr] = entries
+        time.sleep(_SLEEP_ROSTER)
+    return cache
+
+
+def _recent_avg_minutes_head(log, n=8):
+    if log is None or 'MIN' not in log.columns:
+        return None
+
+    def parse_min(m):
+        try:
+            parts = str(m).split(':')
+            return int(parts[0]) + (int(parts[1]) / 60 if len(parts) > 1 else 0)
+        except Exception:
+            return np.nan
+
+    mm = log['MIN'].apply(parse_min).dropna()
+    if len(mm) < 3:
+        return None
+    head = mm.head(min(n, len(mm)))
+    return float(head.mean())
+
+
+def dedupe_redundant_stat_thresholds(props):
+    """
+    Drop easier thresholds when raw hit rate is almost the same as a harder line
+    (e.g. 8+ and 10+ rebounds both printing 96% from the same small sample).
+    """
+    by_key = defaultdict(list)
+    for p in props:
+        by_key[(p['player'], p['stat'])].append(p)
+    out = []
+    for group in by_key.values():
+        group.sort(key=lambda x: x['threshold'], reverse=True)
+        kept = []
+        for p in group:
+            if any(
+                k['threshold'] > p['threshold']
+                and abs(k['raw_hr'] - p['raw_hr']) < PROP_RAW_HR_DEDUPE_EPS
+                for k in kept
+            ):
+                continue
+            kept.append(p)
+        out.extend(kept)
+    return out
 
 def minutes_trend(game_log):
     """Detect significant minutes reduction (injury/load management signal)."""
@@ -743,25 +971,38 @@ def prop_confidence(hit_rate):
     elif hit_rate >= 0.52: return "👀 LEAN",   "★☆☆"
     else:                  return "⚠️  RISKY", "☆☆☆"
 
-def analyze_player_props(team_abbr, opp_abbr, game_log_cache, out_player_keys=None):
+def analyze_player_props(team_abbr, opp_abbr, game_log_cache, out_player_keys=None, roster_entries=None):
     global PROPS_SKIPPED_INJURY
     props = []
     out_player_keys = out_player_keys or set()
+    roster_entries = roster_entries or []
     opp_id     = team_lookup.get(opp_abbr, '')
     opp_def_pm = team_def_ratings.get(opp_id, 0.0)
     # Normalize: league avg pm ~0. Positive pm opp = their D is weak → boost props
     opp_factor = 1.0 + (opp_def_pm / 15.0) * 0.10
     opp_factor = max(0.88, min(1.12, opp_factor))
 
-    for name_frag in KEY_PLAYERS_BY_TEAM.get(team_abbr, []):
-        key = name_frag.lower()
-        if key not in game_log_cache:
-            full_name, log = get_player_recent_stats(name_frag)
-            game_log_cache[key] = (full_name, log)
+    for entry in roster_entries:
+        pid = entry.get('id')
+        roster_name = entry.get('name') or ''
+        cache_key = f"id:{pid}" if pid is not None else f"n:{roster_name.lower()}"
+        if cache_key not in game_log_cache:
+            if pid is not None:
+                full_name, log = get_player_recent_stats_by_id(pid, roster_name)
+            else:
+                full_name, log = get_player_recent_stats(roster_name)
+            game_log_cache[cache_key] = (full_name, log)
             time.sleep(_SLEEP_PROP)
         else:
-            full_name, log = game_log_cache[key]
+            full_name, log = game_log_cache[cache_key]
         if log is None or full_name is None:
+            continue
+
+        if not _log_majority_plays_for_team(log, team_abbr):
+            continue
+
+        ra = _recent_avg_minutes_head(log, n=8)
+        if ra is not None and ra < MIN_AVG_MINUTES_FOR_PROPS:
             continue
 
         if player_listed_out(full_name, out_player_keys):
@@ -793,17 +1034,28 @@ def analyze_player_props(team_abbr, opp_abbr, game_log_cache, out_player_keys=No
                     'min_recent':min_recent,
                     'opp_factor':opp_factor,
                 })
+    props = dedupe_redundant_stat_thresholds(props)
     return props
 
 # Pre-load all player logs
 game_log_cache    = {}
 all_props_by_team = {}
 all_team_pairs    = [(away, home) for away, home in tonight]
+teams_tonight     = {t for pair in all_team_pairs for t in pair}
 
-print(f"  Fetching player stats for {len(set(t for pair in all_team_pairs for t in pair))} teams...")
+print(f"  Loading {len(teams_tonight)} team rosters ({_current_season})…")
+team_roster_cache = build_team_roster_cache(teams_tonight, _current_season)
+
+print(f"  Fetching player stats for {len(teams_tonight)} teams...")
 for away_abbr, home_abbr in all_team_pairs:
     for abbr, opp in [(home_abbr, away_abbr), (away_abbr, home_abbr)]:
-        props = analyze_player_props(abbr, opp, game_log_cache, OUT_PLAYER_KEYS)
+        props = analyze_player_props(
+            abbr,
+            opp,
+            game_log_cache,
+            OUT_PLAYER_KEYS,
+            team_roster_cache.get(abbr),
+        )
         all_props_by_team[abbr] = props
         n = len([p for p in props if p['hit_rate'] >= 0.52])
         PROPS_FETCH_LOG.append({"team": abbr, "opponent": opp, "viable_props": int(n)})
@@ -1010,6 +1262,9 @@ def build_prop_parlays(props, min_legs=2, max_legs=4, top_n=5):
     pool = unique[:18]
     for n in range(min_legs, min(max_legs+1, len(pool)+1)):
         for combo in itertools.combinations(pool, n):
+            matchups = {_prop_matchup_frozen(c) for c in combo}
+            if len(matchups) != 1:
+                continue
             pr = [c['hit_rate'] for c in combo]
             cb = parlay_prob(pr)
             py = parlay_payout(pr)
@@ -1070,13 +1325,19 @@ for p in sorted(all_safe_props, key=lambda x: x['hit_rate'], reverse=True)[:15]:
 
 mixed = []
 for g in strong_games[:4]:
+    mk = frozenset({str(g['away_abbr']).upper(), str(g['home_abbr']).upper()})
     for p1 in top_safe_deduped[:10]:
+        if _prop_matchup_frozen(p1) != mk:
+            continue
         pr = [g['pick_prob'], p1['hit_rate']]
         mixed.append({'game':g,'prop':p1,'combined':parlay_prob(pr),'payout':parlay_payout(pr),'n':2})
         for p2 in top_safe_deduped[:10]:
-            if p2['player'] != p1['player']:
-                pr3 = [g['pick_prob'], p1['hit_rate'], p2['hit_rate']]
-                mixed.append({'game':g,'prop':p1,'prop2':p2,'combined':parlay_prob(pr3),'payout':parlay_payout(pr3),'n':3})
+            if p2['player'] == p1['player']:
+                continue
+            if _prop_matchup_frozen(p2) != mk:
+                continue
+            pr3 = [g['pick_prob'], p1['hit_rate'], p2['hit_rate']]
+            mixed.append({'game':g,'prop':p1,'prop2':p2,'combined':parlay_prob(pr3),'payout':parlay_payout(pr3),'n':3})
 
 def ms(p):
     if p['combined'] < 0.06: return -1
@@ -1489,7 +1750,11 @@ if _JSON_MODE:
         "SAFE PROP PARLAY #1 = steady-value template.",
         "Cap RISKY PARLAYS at $10–20 max.",
         "HOT STREAK parlays = players trending up vs season average.",
-        "Players listed Out (ESPN injury feed) are removed from props and parlays.",
+        "Props use live NBA.com rosters only (no hardcoded player lists). Recent game logs must match that team.",
+        "ESPN injuries: status + fantasyStatus; default excludes out/doubtful/suspended/questionable/day-to-day/GTD (ROLI_ESPN_INJURY_STATUSES).",
+        "Prop parlays only combine legs from the same matchup (no cross-game accidental parlays).",
+        "Near-duplicate stat lines (same raw hit % on easier vs harder thresholds) are collapsed.",
+        "Slate date uses America/New_York by default (ROLI_SCOREBOARD_TZ / ROLI_GAME_DATE).",
         "Second run the same day is faster when model cache hits.",
         "Delete model_cache.pkl weekly if you want a full retrain.",
         "Never bet more than you can afford to lose.",
@@ -1498,7 +1763,7 @@ if _JSON_MODE:
     report = {
         "ok": True,
         "brand": "RoliBot NBA",
-        "generated_at": date.today().isoformat(),
+        "generated_at": roli_generated_at_iso(),
         "bankroll": float(BANKROLL),
         "kelly_fraction": float(KELLY_FRACTION),
         "max_bet_pct": float(MAX_BET_PCT),
@@ -1514,6 +1779,8 @@ if _JSON_MODE:
             "train_games": int(len(X_train)),
             "test_games": int(len(X_test)),
             "schedule_tonight": int(len(tonight)),
+            "slate_date": _run_date.isoformat(),
+            "slate_timezone": os.environ.get("ROLI_SCOREBOARD_TZ") or "America/New_York",
             "props_fetch": PROPS_FETCH_LOG,
             "props_teams_fetched": int(len(set(t for pair in all_team_pairs for t in pair))),
             "props_skipped_injury": int(PROPS_SKIPPED_INJURY),
