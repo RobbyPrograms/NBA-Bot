@@ -2,5 +2,4 @@ xgboost
 scikit-learn
 pandas
 numpy
-matplotlib
 nba_api

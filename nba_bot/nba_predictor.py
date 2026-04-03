@@ -20,9 +20,6 @@ if hasattr(sys.stdout, "reconfigure"):
     except Exception:
         pass
 
-import matplotlib
-matplotlib.use(os.environ.get("MPLBACKEND", "Agg"))
-
 from nba_api.stats.endpoints import leaguegamefinder, scoreboardv2, playergamelog
 from nba_api.stats.static   import teams as nba_teams_static, players as nba_players_static
 import pandas as pd
@@ -36,7 +33,6 @@ try:
     USE_FROZEN = True
 except ImportError:
     USE_FROZEN = False
-import matplotlib.pyplot as plt
 from datetime import date
 
 # ─────────────────────────────────────────────────────────────
@@ -481,19 +477,39 @@ if not cache_valid:
     except Exception:
         print(f"\n  ✓ Ensemble trained & calibrated\n")
 
-    # Feature importance chart
-    importance = pd.Series(xgb_model.feature_importances_, index=feature_cols).sort_values(ascending=False)
-    top15      = importance.head(15)
-    fig, ax    = plt.subplots(figsize=(10, 6))
-    colors     = ['#0F2027' if i < 3 else '#203A43' if i < 8 else '#2C5364' for i in range(len(top15))]
-    ax.barh(top15.index[::-1], top15.values[::-1], color=colors[::-1])
-    ax.set_xlabel('Importance Score')
-    ax.set_title('Top 15 Predictive Features (XGBoost component)', fontweight='bold')
-    plt.tight_layout()
-    chart_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "feature_importance.png")
-    plt.savefig(chart_path, dpi=150, bbox_inches="tight")
-    plt.close()
-    print(f"  ✓ Chart saved: {chart_path}\n")
+    # Feature importance chart (CLI only; Vercel JSON mode skips — no matplotlib in serverless deps)
+    if not _JSON_MODE:
+        try:
+            import matplotlib
+
+            matplotlib.use(os.environ.get("MPLBACKEND", "Agg"))
+            import matplotlib.pyplot as plt
+
+            importance = pd.Series(
+                xgb_model.feature_importances_, index=feature_cols
+            ).sort_values(ascending=False)
+            top15 = importance.head(15)
+            fig, ax = plt.subplots(figsize=(10, 6))
+            colors = [
+                "#0F2027" if i < 3 else "#203A43" if i < 8 else "#2C5364"
+                for i in range(len(top15))
+            ]
+            ax.barh(top15.index[::-1], top15.values[::-1], color=colors[::-1])
+            ax.set_xlabel("Importance Score")
+            ax.set_title(
+                "Top 15 Predictive Features (XGBoost component)", fontweight="bold"
+            )
+            plt.tight_layout()
+            chart_path = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), "feature_importance.png"
+            )
+            plt.savefig(chart_path, dpi=150, bbox_inches="tight")
+            plt.close()
+            print(f"  ✓ Chart saved: {chart_path}\n")
+        except ImportError:
+            print(
+                "  ! matplotlib not installed — skipping feature_importance.png (pip install matplotlib)\n"
+            )
 
 # ============================================================
 #  PHASE 5 — EVALUATE
