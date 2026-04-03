@@ -1,10 +1,10 @@
 # ============================================================
-#  NBA BETTING PREDICTOR — FULL PIPELINE + PARLAY BUILDER
-#  Data → Features → XGBoost AI → Tonight's Bet Slip
-#  + PLAYER PROP PARLAYS (3s, Rebs, Asts, Pts, etc.)
+#  NBA AI BETTING PREDICTOR v3 — FULL PIPELINE
+#  Ensemble ML  •  Player Props  •  Kelly Criterion Sizing
+#  Opponent-Adjusted Props  •  Hot/Cold Streaks  •  Caching
 # ============================================================
 
-import os, sys, time, warnings, itertools
+import os, sys, time, warnings, itertools, pickle, hashlib
 warnings.filterwarnings('ignore')
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -17,32 +17,39 @@ if hasattr(sys.stdout, "reconfigure"):
 import matplotlib
 matplotlib.use(os.environ.get("MPLBACKEND", "Agg"))
 
-from nba_api.stats.endpoints import leaguegamefinder, scoreboardv2, playergamelog, commonteamroster
-from nba_api.stats.static import teams as nba_teams_static, players as nba_players_static
+from nba_api.stats.endpoints import leaguegamefinder, scoreboardv2, playergamelog
+from nba_api.stats.static   import teams as nba_teams_static, players as nba_players_static
 import pandas as pd
 import numpy as np
 import xgboost as xgb
-from sklearn.metrics import accuracy_score, classification_report
-from sklearn.calibration import CalibratedClassifierCV
+from sklearn.ensemble        import RandomForestClassifier
+from sklearn.metrics         import accuracy_score, classification_report, log_loss
+from sklearn.calibration     import CalibratedClassifierCV
 try:
     from sklearn.frozen import FrozenEstimator
     USE_FROZEN = True
 except ImportError:
     USE_FROZEN = False
 import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
 from datetime import date
 
 # ─────────────────────────────────────────────────────────────
-#  HELPER: American odds ↔ implied probability
+#  CONFIG  — edit these to match your situation
+# ─────────────────────────────────────────────────────────────
+BANKROLL          = 1000    # Your total bankroll in $
+KELLY_FRACTION    = 0.25    # Fractional Kelly (0.25 = quarter Kelly, safer)
+MAX_BET_PCT       = 0.05    # Never bet more than 5% of bankroll on one game
+MIN_EDGE_FOR_BET  = 0.03    # Minimum model edge to consider a bet
+MODEL_CACHE_FILE  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "model_cache.pkl")
+PROP_GAMES_BACK   = 20      # Recent games to use for prop analysis
+
+# ─────────────────────────────────────────────────────────────
+#  HELPERS
 # ─────────────────────────────────────────────────────────────
 def prob_to_american(p):
     if p <= 0 or p >= 1:
         return "N/A"
-    if p >= 0.5:
-        return f"-{round((p/(1-p))*100)}"
-    else:
-        return f"+{round(((1-p)/p)*100)}"
+    return f"-{round((p/(1-p))*100)}" if p >= 0.5 else f"+{round(((1-p)/p)*100)}"
 
 def parlay_prob(probs):
     r = 1.0
@@ -51,20 +58,62 @@ def parlay_prob(probs):
     return r
 
 def parlay_payout(probs, stake=100):
-    """Convert parlay probability to approximate payout on $100."""
-    combined = parlay_prob(probs)
-    if combined <= 0:
+    c = parlay_prob(probs)
+    if c <= 0:
         return 0
-    decimal_odds = 1 / combined
-    return round((decimal_odds - 1) * stake, 2)
+    return round((1/c - 1) * stake, 2)
+
+def kelly_bet(prob, american_odds_str, bankroll, fraction=KELLY_FRACTION, max_pct=MAX_BET_PCT):
+    """
+    Kelly Criterion: f* = (b*p - q) / b
+    b = net decimal odds (e.g. -200 → b=0.5, +150 → b=1.5)
+    Returns recommended $ amount to bet.
+    """
+    try:
+        raw = american_odds_str.replace('+','').replace('-','')
+        o   = int(raw)
+        b   = 100/o if american_odds_str.startswith('-') else o/100
+    except Exception:
+        return 0
+    p = prob
+    q = 1 - p
+    kelly_f = (b * p - q) / b
+    if kelly_f <= 0:
+        return 0
+    capped = min(kelly_f * fraction, max_pct)
+    return round(bankroll * capped, 2)
+
+def weighted_hit_rate(hits_array, n_recent=5):
+    """Recent games count 2x vs older games."""
+    if len(hits_array) == 0:
+        return 0.0
+    recent = hits_array[:n_recent]
+    older  = hits_array[n_recent:]
+    w_r    = float(np.mean(recent)) * 2 if len(recent) > 0 else 0.0
+    w_o    = float(np.mean(older))      if len(older)  > 0 else w_r / 2
+    total_w = 2 * len(recent) + len(older)
+    if total_w == 0:
+        return 0.0
+    return (w_r * len(recent) + w_o * len(older)) / total_w
+
+def trend_label(recent_avg, overall_avg):
+    if overall_avg == 0:
+        return ""
+    ratio = recent_avg / overall_avg
+    if ratio >= 1.20:   return "🔥 HOT"
+    elif ratio >= 1.08: return "📈 WARM"
+    elif ratio <= 0.80: return "🥶 COLD"
+    elif ratio <= 0.92: return "📉 COOLING"
+    return ""
 
 # ─────────────────────────────────────────────────────────────
 #  BANNER
 # ─────────────────────────────────────────────────────────────
 print()
 print("╔══════════════════════════════════════════════════════════╗")
-print("║    NBA AI BETTING PREDICTOR  •  PLAYER PROP PARLAYS     ║")
+print("║   NBA AI BETTING PREDICTOR v3  •  ENSEMBLE + KELLY      ║")
 print("╚══════════════════════════════════════════════════════════╝")
+print(f"  Bankroll: ${BANKROLL:,.0f}  |  Kelly fraction: {KELLY_FRACTION:.0%}  |  Max bet: {MAX_BET_PCT:.0%}")
 print()
 
 # ============================================================
@@ -81,11 +130,11 @@ for season in all_seasons:
     print(f"  {season}...", end=" ", flush=True)
     for attempt in range(3):
         try:
-            gf  = leaguegamefinder.LeagueGameFinder(
+            gf = leaguegamefinder.LeagueGameFinder(
                 season_nullable=season,
                 season_type_nullable='Regular Season'
             )
-            df  = gf.get_data_frames()[0]
+            df = gf.get_data_frames()[0]
             all_games.append(df)
             print(f"✓  {len(df):,} rows")
             break
@@ -115,7 +164,7 @@ games['IS_HOME']   = games['MATCHUP'].apply(lambda x: 1 if 'vs.' in x else 0)
 games['GAME_DATE'] = pd.to_datetime(games['GAME_DATE'])
 
 key_cols = ['PTS','FG_PCT','FG3_PCT','FT_PCT','REB','AST','TOV','PLUS_MINUS','STL','BLK']
-games = games.dropna(subset=key_cols).reset_index(drop=True)
+games    = games.dropna(subset=key_cols).reset_index(drop=True)
 
 # Rest / back-to-back
 games['REST_DAYS'] = (
@@ -124,23 +173,33 @@ games['REST_DAYS'] = (
 )
 games['IS_B2B'] = (games['REST_DAYS'] <= 1).astype(int)
 
-# Rolling averages
+# Rolling averages — 10-game and 5-game
 for col in ['PTS','FG_PCT','FG3_PCT','FT_PCT','REB','AST','TOV','PLUS_MINUS','STL','BLK']:
     games[f'{col}_ROLL10'] = (
         games.groupby('TEAM_ID')[col]
         .transform(lambda x: x.shift(1).rolling(10, min_periods=5).mean())
     )
-
-for col in ['PTS','PLUS_MINUS','FG_PCT','TOV','REB']:
+for col in ['PTS','PLUS_MINUS','FG_PCT','TOV','REB','AST','FG3_PCT']:
     games[f'{col}_ROLL5'] = (
         games.groupby('TEAM_ID')[col]
         .transform(lambda x: x.shift(1).rolling(5, min_periods=3).mean())
     )
 
-# Win streak, season win %
+# Rolling variance (consistency signal)
+for col in ['PTS','PLUS_MINUS']:
+    games[f'{col}_VAR10'] = (
+        games.groupby('TEAM_ID')[col]
+        .transform(lambda x: x.shift(1).rolling(10, min_periods=5).std())
+    )
+
+# Win streaks
 games['WIN_STREAK5'] = (
     games.groupby('TEAM_ID')['WIN']
     .transform(lambda x: x.shift(1).rolling(5, min_periods=3).mean())
+)
+games['WIN_STREAK3'] = (
+    games.groupby('TEAM_ID')['WIN']
+    .transform(lambda x: x.shift(1).rolling(3, min_periods=2).mean())
 )
 games['SEASON_WINPCT'] = (
     games.groupby(['TEAM_ID','SEASON_ID'])['WIN']
@@ -150,6 +209,8 @@ games['SEASON_WINPCT'] = (
 # Derived features
 games['OFF_RATING_PROXY'] = games['PTS_ROLL10'] / games['FG_PCT_ROLL10'].replace(0, np.nan)
 games['BALL_CONTROL']     = games['AST_ROLL10'] / games['TOV_ROLL10'].replace(0, np.nan)
+games['THREE_RATE']       = games['FG3_PCT_ROLL10'] * games['FG3_PCT_ROLL5']
+games['MOMENTUM']         = games['PTS_ROLL5'] - games['PTS_ROLL10']   # positive = getting hotter
 
 # Merge home vs away
 home   = games[games['IS_HOME'] == 1].copy()
@@ -158,28 +219,51 @@ merged = home.merge(away, on='GAME_ID', suffixes=('_HOME','_AWAY'))
 merged['HOME_WIN'] = merged['WIN_HOME']
 merged = merged.sort_values('GAME_DATE_HOME').reset_index(drop=True)
 
+# Opponent defensive proxy: pts each side allowed
+merged['DEF_ALLOWED_HOME'] = merged['PTS_AWAY']
+merged['DEF_ALLOWED_AWAY'] = merged['PTS_HOME']
+
+for side in ['HOME','AWAY']:
+    col = f'DEF_ALLOWED_{side}'
+    merged[f'DEF_RATING_ROLL10_{side}'] = (
+        merged.groupby(f'TEAM_ID_{side}')[col]
+        .transform(lambda x: x.shift(1).rolling(10, min_periods=5).mean())
+    )
+
 # Differentials
 merged['PLUS_MINUS_DIFF'] = merged['PLUS_MINUS_ROLL10_HOME'] - merged['PLUS_MINUS_ROLL10_AWAY']
 merged['FG_PCT_DIFF']     = merged['FG_PCT_ROLL10_HOME']     - merged['FG_PCT_ROLL10_AWAY']
 merged['PTS_DIFF']        = merged['PTS_ROLL10_HOME']        - merged['PTS_ROLL10_AWAY']
 merged['WIN_STREAK_DIFF'] = merged['WIN_STREAK5_HOME']       - merged['WIN_STREAK5_AWAY']
+merged['MOMENTUM_DIFF']   = merged['MOMENTUM_HOME']          - merged['MOMENTUM_AWAY']
+merged['DEF_RATING_DIFF'] = merged['DEF_RATING_ROLL10_HOME'] - merged['DEF_RATING_ROLL10_AWAY']
 
 feature_cols = [
+    # Home
     'PTS_ROLL10_HOME','FG_PCT_ROLL10_HOME','FG3_PCT_ROLL10_HOME','FT_PCT_ROLL10_HOME',
     'REB_ROLL10_HOME','AST_ROLL10_HOME','TOV_ROLL10_HOME','PLUS_MINUS_ROLL10_HOME',
     'STL_ROLL10_HOME','BLK_ROLL10_HOME',
-    'PTS_ROLL5_HOME','PLUS_MINUS_ROLL5_HOME','FG_PCT_ROLL5_HOME','TOV_ROLL5_HOME','REB_ROLL5_HOME',
-    'WIN_STREAK5_HOME','SEASON_WINPCT_HOME','REST_DAYS_HOME','IS_B2B_HOME',
-    'OFF_RATING_PROXY_HOME','BALL_CONTROL_HOME',
+    'PTS_ROLL5_HOME','PLUS_MINUS_ROLL5_HOME','FG_PCT_ROLL5_HOME','TOV_ROLL5_HOME',
+    'REB_ROLL5_HOME','AST_ROLL5_HOME','FG3_PCT_ROLL5_HOME',
+    'WIN_STREAK5_HOME','WIN_STREAK3_HOME','SEASON_WINPCT_HOME',
+    'REST_DAYS_HOME','IS_B2B_HOME',
+    'OFF_RATING_PROXY_HOME','BALL_CONTROL_HOME','THREE_RATE_HOME','MOMENTUM_HOME',
+    'PTS_VAR10_HOME','PLUS_MINUS_VAR10_HOME','DEF_RATING_ROLL10_HOME',
+    # Away
     'PTS_ROLL10_AWAY','FG_PCT_ROLL10_AWAY','FG3_PCT_ROLL10_AWAY','FT_PCT_ROLL10_AWAY',
     'REB_ROLL10_AWAY','AST_ROLL10_AWAY','TOV_ROLL10_AWAY','PLUS_MINUS_ROLL10_AWAY',
     'STL_ROLL10_AWAY','BLK_ROLL10_AWAY',
-    'PTS_ROLL5_AWAY','PLUS_MINUS_ROLL5_AWAY','FG_PCT_ROLL5_AWAY','TOV_ROLL5_AWAY','REB_ROLL5_AWAY',
-    'WIN_STREAK5_AWAY','SEASON_WINPCT_AWAY','REST_DAYS_AWAY','IS_B2B_AWAY',
-    'OFF_RATING_PROXY_AWAY','BALL_CONTROL_AWAY',
-    'PLUS_MINUS_DIFF','FG_PCT_DIFF','PTS_DIFF','WIN_STREAK_DIFF',
+    'PTS_ROLL5_AWAY','PLUS_MINUS_ROLL5_AWAY','FG_PCT_ROLL5_AWAY','TOV_ROLL5_AWAY',
+    'REB_ROLL5_AWAY','AST_ROLL5_AWAY','FG3_PCT_ROLL5_AWAY',
+    'WIN_STREAK5_AWAY','WIN_STREAK3_AWAY','SEASON_WINPCT_AWAY',
+    'REST_DAYS_AWAY','IS_B2B_AWAY',
+    'OFF_RATING_PROXY_AWAY','BALL_CONTROL_AWAY','THREE_RATE_AWAY','MOMENTUM_AWAY',
+    'PTS_VAR10_AWAY','PLUS_MINUS_VAR10_AWAY','DEF_RATING_ROLL10_AWAY',
+    # Differentials
+    'PLUS_MINUS_DIFF','FG_PCT_DIFF','PTS_DIFF','WIN_STREAK_DIFF','MOMENTUM_DIFF','DEF_RATING_DIFF',
 ]
 
+feature_cols = [c for c in feature_cols if c in merged.columns]
 merged = merged.dropna(subset=feature_cols).reset_index(drop=True)
 
 print(f"  ✓ Clean training games : {len(merged):,}")
@@ -191,53 +275,121 @@ print(f"  ✓ Date range           : {merged['GAME_DATE_HOME'].min().date()} →
 #  PHASE 3 — TRAIN / TEST SPLIT
 # ============================================================
 print("━" * 60)
-print(" PHASE 3 — Train / test split (time-based, no leakage)...")
+print(" PHASE 3 — Train / test split (time-based)...")
 print("━" * 60)
 
 X = merged[feature_cols]
 y = merged['HOME_WIN']
 
-split    = int(len(X) * 0.80)
-X_train  = X.iloc[:split];  y_train = y.iloc[:split]
-X_test   = X.iloc[split:];  y_test  = y.iloc[split:]
+split   = int(len(X) * 0.80)
+X_train = X.iloc[:split];  y_train = y.iloc[:split]
+X_test  = X.iloc[split:];  y_test  = y.iloc[split:]
 
 print(f"  ✓ Training : {len(X_train):,} games")
 print(f"  ✓ Test     : {len(X_test):,} games\n")
 
 # ============================================================
-#  PHASE 4 — TRAIN XGBOOST
+#  PHASE 4 — ENSEMBLE MODEL (XGBoost + Random Forest)
 # ============================================================
 print("━" * 60)
-print(" PHASE 4 — Training XGBoost AI model...")
+print(" PHASE 4 — Training Ensemble AI (XGBoost + Random Forest)...")
 print("━" * 60)
 
-model = xgb.XGBClassifier(
-    n_estimators          = 500,
-    max_depth             = 4,
-    learning_rate         = 0.03,
-    subsample             = 0.8,
-    colsample_bytree      = 0.8,
-    min_child_weight      = 3,
-    gamma                 = 0.1,
-    reg_alpha             = 0.1,
-    reg_lambda            = 1.5,
-    use_label_encoder     = False,
-    eval_metric           = 'logloss',
-    early_stopping_rounds = 30,
-    random_state          = 42,
-    n_jobs                = -1,
-)
-model.fit(X_train, y_train, eval_set=[(X_test, y_test)], verbose=100)
+# Fingerprint the training data — if unchanged, load cached model
+data_fingerprint = hashlib.md5(pd.util.hash_pandas_object(X_train).values).hexdigest()[:12]
+cache_valid = False
+calibrated  = None
+acc = 0.0
+ll  = 0.0
 
-# Calibrate
-if USE_FROZEN:
-    calibrated = CalibratedClassifierCV(
-        estimator=FrozenEstimator(model), method="isotonic", cv=5
+if os.path.exists(MODEL_CACHE_FILE):
+    try:
+        with open(MODEL_CACHE_FILE, 'rb') as f:
+            cache = pickle.load(f)
+        if cache.get('fingerprint') == data_fingerprint:
+            calibrated  = cache['model']
+            acc         = cache['accuracy']
+            ll          = cache.get('logloss', 0.0)
+            cache_valid = True
+            print(f"  ✓ Cached model loaded  (fingerprint: {data_fingerprint})")
+            print(f"  ✓ Cached accuracy: {acc:.1%}  |  Log-loss: {ll:.4f}\n")
+    except Exception:
+        pass
+
+if not cache_valid:
+    # ── XGBoost ───────────────────────────────────────────
+    xgb_model = xgb.XGBClassifier(
+        n_estimators=600, max_depth=4, learning_rate=0.025,
+        subsample=0.8, colsample_bytree=0.75,
+        min_child_weight=4, gamma=0.15,
+        reg_alpha=0.2, reg_lambda=1.5,
+        use_label_encoder=False, eval_metric='logloss',
+        early_stopping_rounds=40, random_state=42, n_jobs=-1,
     )
-else:
-    calibrated = CalibratedClassifierCV(model, cv='prefit', method='isotonic')
-calibrated.fit(X_test, y_test)
-print("\n  ✓ Model trained & calibrated\n")
+    xgb_model.fit(X_train, y_train, eval_set=[(X_test, y_test)], verbose=100)
+
+    # ── Random Forest ─────────────────────────────────────
+    rf_model = RandomForestClassifier(
+        n_estimators=500, max_depth=8, min_samples_leaf=15,
+        max_features='sqrt', random_state=42, n_jobs=-1,
+        class_weight='balanced',
+    )
+    rf_model.fit(X_train, y_train)
+
+    # ── Calibrate each model ──────────────────────────────
+    if USE_FROZEN:
+        cal_xgb = CalibratedClassifierCV(FrozenEstimator(xgb_model), method='isotonic', cv=5)
+        cal_rf  = CalibratedClassifierCV(FrozenEstimator(rf_model),  method='isotonic', cv=5)
+    else:
+        cal_xgb = CalibratedClassifierCV(xgb_model, cv='prefit', method='isotonic')
+        cal_rf  = CalibratedClassifierCV(rf_model,  cv='prefit', method='isotonic')
+    cal_xgb.fit(X_test, y_test)
+    cal_rf.fit(X_test,  y_test)
+
+    # ── Ensemble: weighted average of calibrated probs ────
+    class EnsembleModel:
+        def __init__(self, models, weights):
+            self.models  = models
+            self.weights = weights
+
+        def predict_proba(self, X):
+            out = np.zeros((len(X), 2))
+            for m, w in zip(self.models, self.weights):
+                out += w * m.predict_proba(X)
+            return out
+
+        def predict(self, X):
+            return (self.predict_proba(X)[:, 1] >= 0.5).astype(int)
+
+    # XGBoost slightly more weight — edges out RF on tabular sports data
+    calibrated = EnsembleModel([cal_xgb, cal_rf], weights=[0.60, 0.40])
+
+    preds = calibrated.predict(X_test)
+    probs = calibrated.predict_proba(X_test)[:, 1]
+    acc   = accuracy_score(y_test, preds)
+    ll    = log_loss(y_test, probs)
+
+    try:
+        with open(MODEL_CACHE_FILE, 'wb') as f:
+            pickle.dump({'model': calibrated, 'fingerprint': data_fingerprint,
+                         'accuracy': acc, 'logloss': ll}, f)
+        print(f"\n  ✓ Ensemble trained & calibrated  |  Cache saved\n")
+    except Exception:
+        print(f"\n  ✓ Ensemble trained & calibrated\n")
+
+    # Feature importance chart
+    importance = pd.Series(xgb_model.feature_importances_, index=feature_cols).sort_values(ascending=False)
+    top15      = importance.head(15)
+    fig, ax    = plt.subplots(figsize=(10, 6))
+    colors     = ['#0F2027' if i < 3 else '#203A43' if i < 8 else '#2C5364' for i in range(len(top15))]
+    ax.barh(top15.index[::-1], top15.values[::-1], color=colors[::-1])
+    ax.set_xlabel('Importance Score')
+    ax.set_title('Top 15 Predictive Features (XGBoost component)', fontweight='bold')
+    plt.tight_layout()
+    chart_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "feature_importance.png")
+    plt.savefig(chart_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"  ✓ Chart saved: {chart_path}\n")
 
 # ============================================================
 #  PHASE 5 — EVALUATE
@@ -249,36 +401,24 @@ print("━" * 60)
 preds = calibrated.predict(X_test)
 probs = calibrated.predict_proba(X_test)[:, 1]
 acc   = accuracy_score(y_test, preds)
+ll    = log_loss(y_test, probs)
 
 print(f"\n  Accuracy on unseen games : {acc:.1%}")
+print(f"  Log-loss (calibration)   : {ll:.4f}  (lower = better calibrated)")
 print(f"  Sportsbook breakeven     : ~52.4%")
 print(f"  Edge over breakeven      : {(acc-0.524)*100:+.1f} pp")
 print(f"\n{classification_report(y_test, preds, target_names=['Away Win','Home Win'])}")
 
-# Calibration check
 print("  Confidence calibration:")
 print(f"  {'Range':>10}  {'Actual win%':>12}  {'n games':>8}")
 for lo, hi in [(0.5,0.55),(0.55,0.60),(0.60,0.65),(0.65,0.70),(0.70,1.0)]:
     mask = (probs >= lo) & (probs < hi)
     if mask.sum() > 10:
         print(f"  {lo:.0%}–{hi:.0%}     {y_test[mask].mean():>11.1%}   {mask.sum():>7}")
-
-# Feature importance chart
-importance = pd.Series(model.feature_importances_, index=feature_cols).sort_values(ascending=False)
-top15      = importance.head(15)
-fig, ax    = plt.subplots(figsize=(10, 6))
-colors     = ['#0F2027' if i < 3 else '#203A43' if i < 8 else '#2C5364' for i in range(len(top15))]
-ax.barh(top15.index[::-1], top15.values[::-1], color=colors[::-1])
-ax.set_xlabel('Importance Score')
-ax.set_title('Top 15 Predictive Features', fontweight='bold')
-plt.tight_layout()
-chart_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "feature_importance.png")
-plt.savefig(chart_path, dpi=150, bbox_inches="tight")
-plt.close()
-print(f"\n  ✓ Chart saved: {chart_path}\n")
+print()
 
 # ============================================================
-#  PHASE 6 — PULL TONIGHT'S REAL GAMES AUTOMATICALLY
+#  PHASE 6 — TONIGHT'S GAMES
 # ============================================================
 print("━" * 60)
 print(" PHASE 6 — Fetching tonight's real NBA schedule...")
@@ -289,8 +429,17 @@ team_lookup      = {t['abbreviation']: t['id'] for t in team_list}
 team_name_lookup = {t['id']: t['full_name'] for t in team_list}
 abbr_lookup      = {t['id']: t['abbreviation'] for t in team_list}
 
+# Defensive rating per team: avg PLUS_MINUS (proxy for how strong their D is)
+def build_team_def_ratings():
+    ratings = {}
+    for tid in games['TEAM_ID'].unique():
+        pm = games[games['TEAM_ID'] == tid]['PLUS_MINUS'].tail(15).mean()
+        ratings[tid] = float(pm) if not np.isnan(pm) else 0.0
+    return ratings
+
+team_def_ratings = build_team_def_ratings()
+
 def get_tonights_games():
-    """Pull tonight's games from NBA scoreboard API."""
     try:
         sb    = scoreboardv2.ScoreboardV2(game_date=date.today().strftime('%Y-%m-%d'))
         ginfo = sb.game_header.get_data_frame()
@@ -298,10 +447,8 @@ def get_tonights_games():
             return []
         matchups = []
         for _, row in ginfo.iterrows():
-            home_id = row.get('HOME_TEAM_ID')
-            away_id = row.get('VISITOR_TEAM_ID')
-            home_abbr = abbr_lookup.get(home_id, '')
-            away_abbr = abbr_lookup.get(away_id, '')
+            home_abbr = abbr_lookup.get(row.get('HOME_TEAM_ID'), '')
+            away_abbr = abbr_lookup.get(row.get('VISITOR_TEAM_ID'), '')
             if home_abbr and away_abbr:
                 matchups.append((away_abbr, home_abbr))
         return matchups
@@ -310,19 +457,11 @@ def get_tonights_games():
         return []
 
 tonight = get_tonights_games()
-
 if tonight:
     print(f"  ✓ Found {len(tonight)} games tonight automatically\n")
 else:
-    print("  ! Auto-fetch returned no games. Using sample matchups.")
-    print("    Edit the 'tonight' list below with real games.\n")
-    tonight = [
-        ('BOS', 'LAL'),
-        ('GSW', 'MIA'),
-        ('DEN', 'NYK'),
-        ('MIL', 'PHX'),
-        ('DAL', 'OKC'),
-    ]
+    print("  ! Auto-fetch returned no games. Using sample matchups.\n")
+    tonight = [('BOS','LAL'),('GSW','MIA'),('DEN','NYK'),('MIL','PHX'),('DAL','OKC')]
 
 # ============================================================
 #  PHASE 6B — PLAYER PROP ENGINE
@@ -331,210 +470,239 @@ print("━" * 60)
 print(" PHASE 6B — Loading player stats for prop predictions...")
 print("━" * 60)
 
-# Prop thresholds to test per stat type
 PROP_THRESHOLDS = {
-    'PTS':  [10, 15, 20, 25, 30],
-    'REB':  [4, 6, 8, 10, 12],
-    'AST':  [3, 5, 7, 10],
-    'FG3M': [1, 2, 3, 4, 5],   # 3-pointers made
+    'PTS':  [10, 15, 20, 25, 30, 35],
+    'REB':  [4, 6, 8, 10, 12, 14],
+    'AST':  [3, 5, 7, 10, 12],
+    'FG3M': [1, 2, 3, 4, 5, 6],
     'STL':  [1, 2],
-    'BLK':  [1, 2],
+    'BLK':  [1, 2, 3],
 }
 
-# Key players to always analyze (stars + role players for value picks)
 KEY_PLAYERS_BY_TEAM = {
-    # Format: TEAM_ABBR: [player_name_fragment, ...]
-    # We'll auto-detect from roster too, but these are prioritized
-    'LAL': ['LeBron', 'Davis', 'Reaves'],
-    'GSW': ['Curry', 'Green', 'Thompson'],
-    'BOS': ['Tatum', 'Brown', 'Holiday'],
-    'DEN': ['Jokic', 'Murray', 'Porter'],
-    'MIL': ['Giannis', 'Lillard', 'Portis'],
-    'PHX': ['Durant', 'Booker', 'Beal'],
-    'NYK': ['Brunson', 'Towns', 'Hart'],
-    'MIA': ['Butler', 'Adebayo', 'Herro'],
-    'OKC': ['Gilgeous', 'Dort', 'Holmgren'],
-    'DAL': ['Doncic', 'Irving', 'Gafford'],
-    'CLE': ['Mitchell', 'Mobley', 'Garland'],
-    'LAC': ['Harden', 'Zubac', 'Powell'],
-    'SAS': ['Wembanyama', 'Johnson', 'Castle'],
-    'MIN': ['Edwards', 'Gobert', 'Towns'],
-    'NOP': ['Williamson', 'Ingram', 'Valanciunas'],
-    'POR': ['Simons', 'Anfernee', 'Smith'],
-    'CHA': ['LaMelo', 'Miles Bridges', 'Richards'],
-    'DET': ['Cunningham', 'Stewart', 'Duren'],
-    'IND': ['Haliburton', 'Siakam', 'Turner'],
-    'ATL': ['Young', 'Murray', 'Okongwu'],
-    'CHI': ['LaVine', 'DeRozan', 'Vucevic'],
-    'TOR': ['Scottie', 'Quickley', 'Boucher'],
-    'WAS': ['Poole', 'Kuzma', 'Beal'],
-    'ORL': ['Paolo', 'Franz', 'Fultz'],
-    'SAC': ['Fox', 'Sabonis', 'Monk'],
-    'UTA': ['Lauri', 'Keyonte', 'Sexton'],
-    'HOU': ['Green', 'Sengun', 'Thompson'],
-    'MEM': ['Morant', 'Jackson', 'Smart'],
-    'NOH': ['Williamson', 'Ingram', 'Murphy'],
+    'LAL': ['LeBron','Davis','Reaves','Hachimura'],
+    'GSW': ['Curry','Green','Kuminga','Wiggins'],
+    'BOS': ['Tatum','Brown','Holiday','Porzingis'],
+    'DEN': ['Jokic','Murray','Porter','Gordon'],
+    'MIL': ['Giannis','Lillard','Portis','Middleton'],
+    'PHX': ['Durant','Booker','Beal','Nurkic'],
+    'NYK': ['Brunson','Towns','Hart','Anunoby'],
+    'MIA': ['Butler','Adebayo','Herro','Love'],
+    'OKC': ['Gilgeous','Dort','Holmgren','Williams'],
+    'DAL': ['Doncic','Irving','Gafford','Washington'],
+    'CLE': ['Mitchell','Mobley','Garland','Allen'],
+    'LAC': ['Harden','Zubac','Powell','Mann'],
+    'SAS': ['Wembanyama','Johnson','Castle','Vassell'],
+    'MIN': ['Edwards','Gobert','Conley','McDaniels'],
+    'NOP': ['Williamson','Ingram','Valanciunas','Murphy'],
+    'POR': ['Simons','Anfernee','Smith','Sharpe'],
+    'CHA': ['LaMelo','Miles Bridges','Richards','Washington'],
+    'DET': ['Cunningham','Stewart','Duren','Harris'],
+    'IND': ['Haliburton','Siakam','Turner','Nembhard'],
+    'ATL': ['Young','Murray','Okongwu','Hunter'],
+    'CHI': ['LaVine','DeRozan','Vucevic','Williams'],
+    'TOR': ['Scottie','Quickley','Boucher','Poeltl'],
+    'WAS': ['Poole','Kuzma','Gafford','Kispert'],
+    'ORL': ['Paolo','Franz','Fultz','Harris'],
+    'SAC': ['Fox','Sabonis','Monk','Huerter'],
+    'UTA': ['Lauri','Keyonte','Sexton','Clarkson'],
+    'HOU': ['Green','Sengun','Thompson','Jabari'],
+    'MEM': ['Morant','Jackson','Smart','Konchar'],
 }
 
-def get_player_recent_stats(player_name_fragment, season='2024-25', n_games=15):
-    """Search for a player and fetch their recent game log."""
+def get_player_recent_stats(name_frag, season='2024-25', n_games=PROP_GAMES_BACK):
     all_players = nba_players_static.get_players()
     matches = [p for p in all_players
-               if player_name_fragment.lower() in p['full_name'].lower()
-               and p['is_active']]
+               if name_frag.lower() in p['full_name'].lower() and p['is_active']]
     if not matches:
         return None, None
-
     player = matches[0]
     try:
         log = playergamelog.PlayerGameLog(
-            player_id=player['id'],
-            season=season,
+            player_id=player['id'], season=season,
             season_type_all_star='Regular Season'
         )
         df = log.get_data_frames()[0]
         if df.empty:
             return None, None
-        # Add FG3M column if not present
-        if 'FG3M' not in df.columns and 'FG3A' in df.columns:
-            df['FG3M'] = df.get('FG3M', 0)
         return player['full_name'], df.head(n_games)
     except Exception:
         return None, None
 
-def compute_prop_probability(game_log, stat_col, threshold):
-    """
-    Compute the empirical probability a player hits 'threshold' in 'stat_col'
-    based on recent game log. Returns (hit_rate, avg, std, n_games).
-    """
+def minutes_trend(game_log):
+    """Detect significant minutes reduction (injury/load management signal)."""
+    if game_log is None or 'MIN' not in game_log.columns:
+        return None, None, ''
+    def parse_min(m):
+        try:
+            parts = str(m).split(':')
+            return int(parts[0]) + (int(parts[1])/60 if len(parts) > 1 else 0)
+        except:
+            return np.nan
+    mins    = game_log['MIN'].apply(parse_min).dropna()
+    if len(mins) < 5:
+        return None, None, ''
+    recent  = mins[:5].mean()
+    overall = mins.mean()
+    flag    = '⚠️ MINUTES DROP' if overall > 0 and (recent / overall) < 0.85 else ''
+    return round(recent, 1), round(overall, 1), flag
+
+def compute_prop_analysis(game_log, stat_col, threshold, opp_def_factor=1.0):
     if game_log is None or stat_col not in game_log.columns:
-        return None, None, None, 0
-
-    vals = pd.to_numeric(game_log[stat_col], errors='coerce').dropna()
+        return None
+    vals = pd.to_numeric(game_log[stat_col], errors='coerce').dropna().values
     if len(vals) < 5:
-        return None, None, None, len(vals)
-
-    hit_rate = (vals >= threshold).mean()
-    avg      = vals.mean()
-    std      = vals.std()
-    return hit_rate, avg, std, len(vals)
-
-def analyze_player_props(team_abbr, game_log_cache):
-    """
-    For a given team, pull key players and analyze their props.
-    Returns list of prop dicts with probability info.
-    """
-    props = []
-    player_names = KEY_PLAYERS_BY_TEAM.get(team_abbr, [])
-
-    for name_frag in player_names:
-        cache_key = name_frag.lower()
-        if cache_key not in game_log_cache:
-            full_name, log = get_player_recent_stats(name_frag)
-            game_log_cache[cache_key] = (full_name, log)
-            time.sleep(0.8)  # rate limit
-        else:
-            full_name, log = game_log_cache[cache_key]
-
-        if log is None or full_name is None:
-            continue
-
-        for stat, thresholds in PROP_THRESHOLDS.items():
-            for thresh in thresholds:
-                hit_rate, avg, std, n = compute_prop_probability(log, stat, thresh)
-                if hit_rate is None or n < 5:
-                    continue
-
-                # Only include props where the line is meaningful
-                if avg is None or avg < thresh * 0.5:
-                    continue
-
-                # Skip trivially easy props (>95%) or impossible ones (<5%)
-                if hit_rate > 0.95 or hit_rate < 0.05:
-                    continue
-
-                label = _prop_label(stat, thresh)
-
-                props.append({
-                    'player':    full_name,
-                    'team':      team_abbr,
-                    'stat':      stat,
-                    'threshold': thresh,
-                    'label':     label,
-                    'hit_rate':  hit_rate,
-                    'avg':       avg,
-                    'std':       std if std else 0,
-                    'n_games':   n,
-                })
-
-    return props
+        return None
+    hits        = (vals >= threshold).astype(float)
+    w_hit_rate  = weighted_hit_rate(hits, n_recent=5)
+    avg_overall = vals.mean()
+    avg_recent  = vals[:5].mean() if len(vals) >= 5 else avg_overall
+    # Skip trivial / impossible props
+    if w_hit_rate > 0.96 or w_hit_rate < 0.04:
+        return None
+    if avg_overall < threshold * 0.4:
+        return None
+    # Opponent defensive adjustment (scoring props only)
+    adj_hit = w_hit_rate
+    if stat_col in ('PTS', 'FG3M'):
+        adj_hit = min(0.95, max(0.05, w_hit_rate * opp_def_factor))
+    return {
+        'hit_rate':   adj_hit,
+        'raw_hr':     (vals >= threshold).mean(),
+        'avg':        avg_overall,
+        'avg_recent': avg_recent,
+        'std':        vals.std(),
+        'n_games':    len(vals),
+        'trend':      trend_label(avg_recent, avg_overall),
+    }
 
 def _prop_label(stat, thresh):
-    labels = {
+    return {
         'PTS':  f"{thresh}+ Points",
         'REB':  f"{thresh}+ Rebounds",
         'AST':  f"{thresh}+ Assists",
         'FG3M': f"{thresh}+ Three-Pointers",
         'STL':  f"{thresh}+ Steals",
         'BLK':  f"{thresh}+ Blocks",
-    }
-    return labels.get(stat, f"{thresh}+ {stat}")
+    }.get(stat, f"{thresh}+ {stat}")
 
 def prop_confidence(hit_rate):
-    if hit_rate >= 0.78:
-        return "🔥 STRONG", "★★★"
-    elif hit_rate >= 0.65:
-        return "✅ GOOD", "★★☆"
-    elif hit_rate >= 0.52:
-        return "👀 LEAN", "★☆☆"
-    else:
-        return "⚠️  RISKY", "☆☆☆"
+    if hit_rate >= 0.78:   return "🔥 STRONG", "★★★"
+    elif hit_rate >= 0.65: return "✅ GOOD",   "★★☆"
+    elif hit_rate >= 0.52: return "👀 LEAN",   "★☆☆"
+    else:                  return "⚠️  RISKY", "☆☆☆"
+
+def analyze_player_props(team_abbr, opp_abbr, game_log_cache):
+    props = []
+    opp_id     = team_lookup.get(opp_abbr, '')
+    opp_def_pm = team_def_ratings.get(opp_id, 0.0)
+    # Normalize: league avg pm ~0. Positive pm opp = their D is weak → boost props
+    opp_factor = 1.0 + (opp_def_pm / 15.0) * 0.10
+    opp_factor = max(0.88, min(1.12, opp_factor))
+
+    for name_frag in KEY_PLAYERS_BY_TEAM.get(team_abbr, []):
+        key = name_frag.lower()
+        if key not in game_log_cache:
+            full_name, log = get_player_recent_stats(name_frag)
+            game_log_cache[key] = (full_name, log)
+            time.sleep(0.8)
+        else:
+            full_name, log = game_log_cache[key]
+        if log is None or full_name is None:
+            continue
+
+        min_recent, min_overall, min_flag = minutes_trend(log)
+
+        for stat, thresholds in PROP_THRESHOLDS.items():
+            for thresh in thresholds:
+                a = compute_prop_analysis(log, stat, thresh, opp_factor)
+                if a is None:
+                    continue
+                props.append({
+                    'player':    full_name,
+                    'team':      team_abbr,
+                    'opp':       opp_abbr,
+                    'stat':      stat,
+                    'threshold': thresh,
+                    'label':     _prop_label(stat, thresh),
+                    'hit_rate':  a['hit_rate'],
+                    'raw_hr':    a['raw_hr'],
+                    'avg':       a['avg'],
+                    'avg_recent':a['avg_recent'],
+                    'std':       a['std'],
+                    'n_games':   a['n_games'],
+                    'trend':     a['trend'],
+                    'min_flag':  min_flag,
+                    'min_recent':min_recent,
+                    'opp_factor':opp_factor,
+                })
+    return props
 
 # Pre-load all player logs
-game_log_cache = {}
-all_team_abbrs = list(set([t for pair in tonight for t in pair]))
-
-print(f"  Fetching player stats for {len(all_team_abbrs)} teams...")
+game_log_cache    = {}
 all_props_by_team = {}
-for abbr in all_team_abbrs:
-    props = analyze_player_props(abbr, game_log_cache)
-    all_props_by_team[abbr] = props
-    n = len([p for p in props if p['hit_rate'] >= 0.52])
-    print(f"  ✓ {abbr}: {n} viable props found")
+all_team_pairs    = [(away, home) for away, home in tonight]
 
+print(f"  Fetching player stats for {len(set(t for pair in all_team_pairs for t in pair))} teams...")
+for away_abbr, home_abbr in all_team_pairs:
+    for abbr, opp in [(home_abbr, away_abbr), (away_abbr, home_abbr)]:
+        props = analyze_player_props(abbr, opp, game_log_cache)
+        all_props_by_team[abbr] = props
+        n = len([p for p in props if p['hit_rate'] >= 0.52])
+        print(f"  ✓ {abbr} (vs {opp}): {n} viable props")
 print()
 
 # ============================================================
-#  PHASE 7 — PREDICT EVERY GAME + BUILD PARLAYS
+#  PHASE 7 — PREDICTIONS + KELLY SIZING
 # ============================================================
 print("━" * 60)
-print(" PHASE 7 — AI Predictions + Parlay Builder")
+print(" PHASE 7 — AI Predictions + Kelly Criterion Sizing")
 print("━" * 60)
 
 def get_team_features(team_id, rest_days=2, is_b2b=0):
-    tg = games[games['TEAM_ID'] == team_id].copy()
+    tg = games[games['TEAM_ID'] == team_id]
     if len(tg) < 5:
         return None
     latest = tg.iloc[-1]
-    stat_map = {
-        'PTS_ROLL10','FG_PCT_ROLL10','FG3_PCT_ROLL10','FT_PCT_ROLL10',
-        'REB_ROLL10','AST_ROLL10','TOV_ROLL10','PLUS_MINUS_ROLL10','STL_ROLL10','BLK_ROLL10',
-        'PTS_ROLL5','PLUS_MINUS_ROLL5','FG_PCT_ROLL5','TOV_ROLL5','REB_ROLL5',
-        'WIN_STREAK5','SEASON_WINPCT','OFF_RATING_PROXY','BALL_CONTROL',
+    return {
+        'PTS_ROLL10': latest.get('PTS_ROLL10', np.nan),
+        'FG_PCT_ROLL10': latest.get('FG_PCT_ROLL10', np.nan),
+        'FG3_PCT_ROLL10': latest.get('FG3_PCT_ROLL10', np.nan),
+        'FT_PCT_ROLL10': latest.get('FT_PCT_ROLL10', np.nan),
+        'REB_ROLL10': latest.get('REB_ROLL10', np.nan),
+        'AST_ROLL10': latest.get('AST_ROLL10', np.nan),
+        'TOV_ROLL10': latest.get('TOV_ROLL10', np.nan),
+        'PLUS_MINUS_ROLL10': latest.get('PLUS_MINUS_ROLL10', np.nan),
+        'STL_ROLL10': latest.get('STL_ROLL10', np.nan),
+        'BLK_ROLL10': latest.get('BLK_ROLL10', np.nan),
+        'PTS_ROLL5': latest.get('PTS_ROLL5', np.nan),
+        'PLUS_MINUS_ROLL5': latest.get('PLUS_MINUS_ROLL5', np.nan),
+        'FG_PCT_ROLL5': latest.get('FG_PCT_ROLL5', np.nan),
+        'TOV_ROLL5': latest.get('TOV_ROLL5', np.nan),
+        'REB_ROLL5': latest.get('REB_ROLL5', np.nan),
+        'AST_ROLL5': latest.get('AST_ROLL5', np.nan),
+        'FG3_PCT_ROLL5': latest.get('FG3_PCT_ROLL5', np.nan),
+        'WIN_STREAK5': latest.get('WIN_STREAK5', np.nan),
+        'WIN_STREAK3': latest.get('WIN_STREAK3', np.nan),
+        'SEASON_WINPCT': latest.get('SEASON_WINPCT', np.nan),
+        'REST_DAYS': rest_days,
+        'IS_B2B': is_b2b,
+        'OFF_RATING_PROXY': latest.get('OFF_RATING_PROXY', np.nan),
+        'BALL_CONTROL': latest.get('BALL_CONTROL', np.nan),
+        'THREE_RATE': latest.get('THREE_RATE', np.nan),
+        'MOMENTUM': latest.get('MOMENTUM', np.nan),
+        'PTS_VAR10': latest.get('PTS_VAR10', np.nan),
+        'PLUS_MINUS_VAR10': latest.get('PLUS_MINUS_VAR10', np.nan),
+        'DEF_RATING_ROLL10': latest.get('DEF_RATING_ROLL10', np.nan),
     }
-    feats = {col: latest.get(col, np.nan) for col in stat_map}
-    feats['REST_DAYS'] = rest_days
-    feats['IS_B2B']    = is_b2b
-    return feats
 
-def predict_game(home_abbr, away_abbr, home_rest=2, away_rest=2, home_b2b=0, away_b2b=0):
+def predict_game(home_abbr, away_abbr):
     home_id = team_lookup.get(home_abbr.upper())
     away_id = team_lookup.get(away_abbr.upper())
     if not home_id or not away_id:
         return None
-
-    hf = get_team_features(home_id, home_rest, home_b2b)
-    af = get_team_features(away_id, away_rest, away_b2b)
+    hf = get_team_features(home_id)
+    af = get_team_features(away_id)
     if hf is None or af is None:
         return None
 
@@ -549,12 +717,13 @@ def predict_game(home_abbr, away_abbr, home_rest=2, away_rest=2, home_b2b=0, awa
     row['FG_PCT_DIFF']     = hf.get('FG_PCT_ROLL10',0)     - af.get('FG_PCT_ROLL10',0)
     row['PTS_DIFF']        = hf.get('PTS_ROLL10',0)        - af.get('PTS_ROLL10',0)
     row['WIN_STREAK_DIFF'] = hf.get('WIN_STREAK5',0)       - af.get('WIN_STREAK5',0)
+    row['MOMENTUM_DIFF']   = hf.get('MOMENTUM',0)          - af.get('MOMENTUM',0)
+    row['DEF_RATING_DIFF'] = hf.get('DEF_RATING_ROLL10',0) - af.get('DEF_RATING_ROLL10',0)
 
-    X_pred    = pd.DataFrame([row])[feature_cols]
+    X_pred    = pd.DataFrame([{c: row.get(c, np.nan) for c in feature_cols}])[feature_cols]
     prob_home = calibrated.predict_proba(X_pred)[0][1]
     return prob_home
 
-# ── Run every game ────────────────────────────────────────────
 print()
 game_results = []
 
@@ -568,31 +737,19 @@ for away_abbr, home_abbr in tonight:
     away_name  = team_name_lookup.get(team_lookup.get(away_abbr,''), away_abbr)
 
     if prob_home >= prob_away:
-        pick_name = home_name
-        pick_abbr = home_abbr
-        pick_prob = prob_home
-        pick_side = "HOME"
+        pick_name, pick_abbr, pick_prob, pick_side = home_name, home_abbr, prob_home, "HOME"
     else:
-        pick_name = away_name
-        pick_abbr = away_abbr
-        pick_prob = prob_away
-        pick_side = "AWAY"
+        pick_name, pick_abbr, pick_prob, pick_side = away_name, away_abbr, prob_away, "AWAY"
 
-    edge = pick_prob - 0.5
-    if edge >= 0.15:
-        confidence = "🔥 STRONG"
-        stars      = "★★★"
-    elif edge >= 0.09:
-        confidence = "✅ GOOD"
-        stars      = "★★☆"
-    elif edge >= 0.05:
-        confidence = "👀 LEAN"
-        stars      = "★☆☆"
-    else:
-        confidence = "⚠️  SKIP"
-        stars      = "☆☆☆"
+    pick_odds = prob_to_american(pick_prob)
+    edge      = pick_prob - 0.5
+    kelly_amt = kelly_bet(pick_prob, pick_odds, BANKROLL)
 
-    # Collect props for both teams in this game
+    if edge >= 0.15:   confidence, stars = "🔥 STRONG", "★★★"
+    elif edge >= 0.09: confidence, stars = "✅ GOOD",   "★★☆"
+    elif edge >= 0.05: confidence, stars = "👀 LEAN",   "★☆☆"
+    else:              confidence, stars = "⚠️  SKIP",  "☆☆☆"
+
     game_props = all_props_by_team.get(home_abbr, []) + all_props_by_team.get(away_abbr, [])
 
     game_results.append({
@@ -601,13 +758,14 @@ for away_abbr, home_abbr in tonight:
         'prob_home': prob_home, 'prob_away': prob_away,
         'pick_name': pick_name, 'pick_abbr': pick_abbr,
         'pick_prob': pick_prob, 'pick_side': pick_side,
-        'edge': edge, 'confidence': confidence, 'stars': stars,
-        'props': game_props,
+        'pick_odds': pick_odds, 'edge': edge,
+        'confidence': confidence, 'stars': stars,
+        'kelly_amt': kelly_amt, 'props': game_props,
     })
 
 game_results.sort(key=lambda x: x['edge'], reverse=True)
 
-# ── Print individual game predictions ─────────────────────────
+# ── Game predictions printout ───────────────────────────────
 print("┌" + "─"*58 + "┐")
 print("│{:^58}│".format("TONIGHT'S GAME PREDICTIONS"))
 print("└" + "─"*58 + "┘")
@@ -620,45 +778,54 @@ for g in game_results:
     print(f"  Away  ({g['away_abbr']})  :  {g['prob_away']:>5.1%}  {prob_to_american(g['prob_away']):>6}")
     print(f"  Pick  →  {g['pick_name']} ({g['pick_side']})")
     print(f"  Signal:  {g['confidence']}  {g['stars']}")
+    if g['kelly_amt'] > 0 and g['edge'] >= MIN_EDGE_FOR_BET:
+        print(f"  Kelly recommended bet:  ${g['kelly_amt']:,.2f}  (of ${BANKROLL:,.0f})")
 
 # ============================================================
-#  PHASE 8 — PLAYER PROP BREAKDOWN PER GAME
+#  PHASE 8 — PLAYER PROP BREAKDOWN
 # ============================================================
 print()
 print("┌" + "─"*58 + "┐")
 print("│{:^58}│".format("PLAYER PROPS — PER GAME BREAKDOWN"))
 print("└" + "─"*58 + "┘")
 
-all_safe_props   = []  # hit_rate >= 0.65
-all_risky_props  = []  # hit_rate 0.40–0.64 (long shots with upside)
+all_safe_props  = []
+all_risky_props = []
 
 for g in game_results:
     print()
     print(f"  ╔═ {g['away_name']} @ {g['home_name']} ═╗")
 
-    game_safe  = [p for p in g['props'] if p['hit_rate'] >= 0.65]
-    game_risky = [p for p in g['props'] if 0.35 <= p['hit_rate'] < 0.52]
+    safe    = [p for p in g['props'] if p['hit_rate'] >= 0.65 and not p['min_flag']]
+    risky   = [p for p in g['props'] if 0.33 <= p['hit_rate'] < 0.50]
+    flagged = list({p['player'] for p in g['props'] if p['min_flag']})
 
-    # Sort by hit rate desc
-    game_safe.sort(key=lambda x: x['hit_rate'], reverse=True)
-    game_risky.sort(key=lambda x: x['hit_rate'], reverse=True)
+    safe.sort(key=lambda x: x['hit_rate'], reverse=True)
+    risky.sort(key=lambda x: x['hit_rate'], reverse=True)
 
-    if game_safe:
-        print(f"  🎯 TOP PROPS (high confidence):")
-        for p in game_safe[:6]:
+    if safe:
+        print("  🎯 TOP PROPS (high confidence):")
+        for p in safe[:7]:
             conf, stars = prop_confidence(p['hit_rate'])
-            avg_str = f"avg {p['avg']:.1f}"
-            print(f"     {p['player']:25s}  {p['label']:22s}  {p['hit_rate']:.0%}  {conf}  {avg_str}")
-        all_safe_props.extend(game_safe)
+            trend_str   = f"  {p['trend']}" if p['trend'] else ''
+            adj_str     = f"  [opp adj ×{p['opp_factor']:.2f}]" if abs(p['opp_factor']-1.0) > 0.02 else ''
+            print(f"     {p['player']:25s}  {p['label']:22s}  {p['hit_rate']:.0%}  {stars}{trend_str}{adj_str}")
+        all_safe_props.extend(safe)
     else:
-        print(f"  (No high-confidence props found for this game)")
+        print("  (No high-confidence props for this game)")
 
-    if game_risky:
-        print(f"  💣 RISKY PICKS (high payout potential):")
-        for p in game_risky[:4]:
-            avg_str = f"avg {p['avg']:.1f}"
-            print(f"     {p['player']:25s}  {p['label']:22s}  {p['hit_rate']:.0%}  ⚠️  RISKY  {avg_str}")
-        all_risky_props.extend(game_risky)
+    if risky:
+        print("  💣 RISKY PICKS (high payout potential):")
+        for p in risky[:4]:
+            trend_str = f"  {p['trend']}" if p['trend'] else ''
+            print(f"     {p['player']:25s}  {p['label']:22s}  {p['hit_rate']:.0%}  avg {p['avg']:.1f}{trend_str}")
+        all_risky_props.extend(risky)
+
+    if flagged:
+        print("  ⚠️  MINUTES CONCERNS (skip these players' props):")
+        for player in flagged[:3]:
+            mp = next(p for p in g['props'] if p['player']==player and p['min_flag'])
+            print(f"     {player}  —  recent {mp['min_recent']}mpg  {mp['min_flag']}")
 
 # ============================================================
 #  PHASE 9 — PLAYER PROP PARLAYS
@@ -669,144 +836,126 @@ print("│{:^58}│".format("PLAYER PROP PARLAYS"))
 print("└" + "─"*58 + "┘")
 print()
 
-def build_prop_parlays(props, min_legs=2, max_legs=4, top_n=8, label=""):
-    """Build and rank prop parlays from a pool of props."""
+def build_prop_parlays(props, min_legs=2, max_legs=4, top_n=5):
     if len(props) < min_legs:
-        print(f"  Not enough props for {label} parlays.\n")
         return []
-
-    # Deduplicate: keep best prop per player (avoid stacking same player)
-    seen_players = {}
-    unique_props = []
+    # Best prop per player only (no stacking same player)
+    seen, unique = set(), []
     for p in sorted(props, key=lambda x: x['hit_rate'], reverse=True):
-        key = (p['player'], p['stat'])
-        if p['player'] not in seen_players:
-            seen_players[p['player']] = True
-            unique_props.append(p)
-        elif key not in seen_players:
-            seen_players[key] = True
-            unique_props.append(p)
+        if p['player'] not in seen:
+            seen.add(p['player'])
+            unique.append(p)
 
     all_parlays = []
-    pool = unique_props[:20]  # Cap to avoid combinatorial explosion
-
-    for n_legs in range(min_legs, min(max_legs+1, len(pool)+1)):
-        for combo in itertools.combinations(pool, n_legs):
-            probs    = [c['hit_rate'] for c in combo]
-            combined = parlay_prob(probs)
-            payout   = parlay_payout(probs, stake=100)
-            all_parlays.append({
-                'legs': list(combo), 'combined': combined,
-                'payout': payout, 'n': n_legs
-            })
+    pool = unique[:18]
+    for n in range(min_legs, min(max_legs+1, len(pool)+1)):
+        for combo in itertools.combinations(pool, n):
+            pr = [c['hit_rate'] for c in combo]
+            cb = parlay_prob(pr)
+            py = parlay_payout(pr)
+            tb = sum(0.05 for c in combo if '🔥' in c.get('trend',''))
+            all_parlays.append({'legs':list(combo),'combined':cb,'payout':py,'n':n,'trend_bonus':tb})
 
     def score(p):
-        if p['combined'] < 0.05:
-            return -1
-        return p['combined'] * np.log1p(p['payout'])
+        if p['combined'] < 0.04: return -1
+        return (p['combined'] + p['trend_bonus']) * np.log1p(p['payout'])
 
     all_parlays.sort(key=score, reverse=True)
     return all_parlays[:top_n]
 
-# ── SAFE PROP PARLAYS ─────────────────────────────────────────
+# Safe
 print("  ━━━ 🎯 SAFE PROP PARLAYS (High Hit Rate) ━━━")
 print()
-safe_parlays = build_prop_parlays(all_safe_props, min_legs=2, max_legs=4, top_n=5, label="safe")
-
-for i, parlay in enumerate(safe_parlays, 1):
-    print(f"  PROP PARLAY #{i}  —  {parlay['n']}-LEG  ({parlay['combined']:.1%} hit chance)")
+safe_parlays = build_prop_parlays(all_safe_props, min_legs=2, max_legs=4)
+for i, p in enumerate(safe_parlays, 1):
+    k = kelly_bet(p['combined'], prob_to_american(p['combined']), BANKROLL)
+    print(f"  PROP PARLAY #{i}  —  {p['n']}-LEG  ({p['combined']:.1%} hit chance)")
     print(f"  {'─'*50}")
-    for leg in parlay['legs']:
-        conf, stars = prop_confidence(leg['hit_rate'])
-        print(f"   ▸ {leg['player']:25s}  {leg['label']:22s}  {leg['hit_rate']:.0%}  {stars}")
-    print(f"  Combined probability : {parlay['combined']:.1%}")
-    print(f"  Approx payout (100$) : ${parlay['payout']:,.2f}")
-    print(f"  Implied odds         : {prob_to_american(parlay['combined'])}")
+    for leg in p['legs']:
+        c, s = prop_confidence(leg['hit_rate'])
+        t    = f"  {leg['trend']}" if leg['trend'] else ''
+        print(f"   ▸ {leg['player']:25s}  {leg['label']:22s}  {leg['hit_rate']:.0%}  {s}{t}")
+    print(f"  Combined probability : {p['combined']:.1%}")
+    print(f"  Approx payout (100$) : ${p['payout']:,.2f}")
+    print(f"  Implied odds         : {prob_to_american(p['combined'])}")
+    if k > 0:
+        print(f"  Kelly bet size       : ${k:,.2f}")
     print()
 
-# ── RISKY PROP PARLAYS ────────────────────────────────────────
+# Risky
 print("  ━━━ 💣 RISKY PROP PARLAYS (Long Shots / Big Payouts) ━━━")
 print()
-risky_parlays = build_prop_parlays(all_risky_props, min_legs=2, max_legs=5, top_n=5, label="risky")
-
-for i, parlay in enumerate(risky_parlays, 1):
-    print(f"  RISKY PARLAY #{i}  —  {parlay['n']}-LEG  ({parlay['combined']:.1%} hit chance)")
+risky_parlays = build_prop_parlays(all_risky_props, min_legs=2, max_legs=5)
+for i, p in enumerate(risky_parlays, 1):
+    print(f"  RISKY PARLAY #{i}  —  {p['n']}-LEG  ({p['combined']:.1%} hit chance)")
     print(f"  {'─'*50}")
-    for leg in parlay['legs']:
-        print(f"   ⚡ {leg['player']:25s}  {leg['label']:22s}  {leg['hit_rate']:.0%}  avg {leg['avg']:.1f}")
-    print(f"  Combined probability : {parlay['combined']:.1%}")
-    print(f"  Approx payout (100$) : ${parlay['payout']:,.2f}")
-    print(f"  Implied odds         : {prob_to_american(parlay['combined'])}")
+    for leg in p['legs']:
+        t = f"  {leg['trend']}" if leg['trend'] else ''
+        print(f"   ⚡ {leg['player']:25s}  {leg['label']:22s}  {leg['hit_rate']:.0%}  avg {leg['avg']:.1f}{t}")
+    print(f"  Combined probability : {p['combined']:.1%}")
+    print(f"  Approx payout (100$) : ${p['payout']:,.2f}")
+    print(f"  Implied odds         : {prob_to_american(p['combined'])}")
+    print(f"  ⚠️  Long shot — cap at $10-20 max")
     print()
 
-# ── MIXED PARLAYS: Team ML + Player Props ─────────────────────
+# Mixed: Team ML + Props
 print("  ━━━ 🔀 MIXED PARLAYS (Team ML + Player Props) ━━━")
 print()
-
-# Take best 2 game picks + 1-2 top player props each
 strong_games = [g for g in game_results if g['edge'] >= 0.09]
-top_props_flat = sorted(all_safe_props, key=lambda x: x['hit_rate'], reverse=True)[:10]
+seen_p, top_safe_deduped = set(), []
+for p in sorted(all_safe_props, key=lambda x: x['hit_rate'], reverse=True)[:15]:
+    if p['player'] not in seen_p:
+        seen_p.add(p['player'])
+        top_safe_deduped.append(p)
 
-# Deduplicate by player
-seen = set()
-top_props_deduped = []
-for p in top_props_flat:
-    if p['player'] not in seen:
-        seen.add(p['player'])
-        top_props_deduped.append(p)
+mixed = []
+for g in strong_games[:4]:
+    for p1 in top_safe_deduped[:10]:
+        pr = [g['pick_prob'], p1['hit_rate']]
+        mixed.append({'game':g,'prop':p1,'combined':parlay_prob(pr),'payout':parlay_payout(pr),'n':2})
+        for p2 in top_safe_deduped[:10]:
+            if p2['player'] != p1['player']:
+                pr3 = [g['pick_prob'], p1['hit_rate'], p2['hit_rate']]
+                mixed.append({'game':g,'prop':p1,'prop2':p2,'combined':parlay_prob(pr3),'payout':parlay_payout(pr3),'n':3})
 
-mixed_parlays = []
-for g in strong_games[:3]:
-    for prop in top_props_deduped[:8]:
-        # Don't mix same team's prop with their ML unless it adds value
-        probs    = [g['pick_prob'], prop['hit_rate']]
-        combined = parlay_prob(probs)
-        payout   = parlay_payout(probs, stake=100)
-        mixed_parlays.append({
-            'game': g,
-            'prop': prop,
-            'combined': combined,
-            'payout': payout,
-            'n': 2,
-        })
-
-        # 3-leg: game + 2 props
-        for prop2 in top_props_deduped[:8]:
-            if prop2['player'] != prop['player']:
-                probs3    = [g['pick_prob'], prop['hit_rate'], prop2['hit_rate']]
-                combined3 = parlay_prob(probs3)
-                payout3   = parlay_payout(probs3, stake=100)
-                mixed_parlays.append({
-                    'game': g,
-                    'prop': prop,
-                    'prop2': prop2,
-                    'combined': combined3,
-                    'payout': payout3,
-                    'n': 3,
-                })
-
-def mixed_score(p):
-    if p['combined'] < 0.08:
-        return -1
+def ms(p):
+    if p['combined'] < 0.06: return -1
     return p['combined'] * np.log1p(p['payout'])
 
-mixed_parlays.sort(key=mixed_score, reverse=True)
-top_mixed = mixed_parlays[:5]
-
-for i, m in enumerate(top_mixed, 1):
+mixed.sort(key=ms, reverse=True)
+for i, m in enumerate(mixed[:5], 1):
+    k = kelly_bet(m['combined'], prob_to_american(m['combined']), BANKROLL)
+    g = m['game']
     print(f"  MIXED PARLAY #{i}  —  {m['n']}-LEG")
     print(f"  {'─'*50}")
-    g = m['game']
     print(f"   🏀 {g['pick_name']:30s}  ({g['pick_side']})  {g['pick_prob']:.0%}  {g['stars']}")
     p1 = m['prop']
-    print(f"   ▸ {p1['player']:28s}  {p1['label']:22s}  {p1['hit_rate']:.0%}")
+    print(f"   ▸ {p1['player']:28s}  {p1['label']:22s}  {p1['hit_rate']:.0%}{'  '+p1['trend'] if p1['trend'] else ''}")
     if 'prop2' in m:
         p2 = m['prop2']
-        print(f"   ▸ {p2['player']:28s}  {p2['label']:22s}  {p2['hit_rate']:.0%}")
+        print(f"   ▸ {p2['player']:28s}  {p2['label']:22s}  {p2['hit_rate']:.0%}{'  '+p2['trend'] if p2['trend'] else ''}")
     print(f"  Combined probability : {m['combined']:.1%}")
     print(f"  Approx payout (100$) : ${m['payout']:,.2f}")
     print(f"  Implied odds         : {prob_to_american(m['combined'])}")
+    if k > 0:
+        print(f"  Kelly bet size       : ${k:,.2f}")
     print()
+
+# Hot streak specials
+hot_props = [p for p in all_safe_props if '🔥' in p.get('trend','') or '📈' in p.get('trend','')]
+if hot_props:
+    print("  ━━━ 🔥 HOT STREAK SPECIALS ━━━")
+    print("  (Players trending significantly UP vs their season average)")
+    print()
+    hot_parlays = build_prop_parlays(hot_props, min_legs=2, max_legs=3, top_n=3)
+    for i, p in enumerate(hot_parlays, 1):
+        print(f"  HOT PARLAY #{i}  —  {p['n']}-LEG")
+        print(f"  {'─'*50}")
+        for leg in p['legs']:
+            print(f"   🔥 {leg['player']:25s}  {leg['label']:22s}  {leg['hit_rate']:.0%}  {leg['trend']}  (recent {leg['avg_recent']:.1f} vs season {leg['avg']:.1f})")
+        print(f"  Combined probability : {p['combined']:.1%}")
+        print(f"  Approx payout (100$) : ${p['payout']:,.2f}")
+        print()
 
 # ============================================================
 #  PHASE 10 — FINAL BET SLIP
@@ -815,94 +964,101 @@ print("┌" + "─"*58 + "┐")
 print("│{:^58}│".format("YOUR BET SLIP FOR TONIGHT"))
 print("└" + "─"*58 + "┘")
 print()
+print(f"  Bankroll: ${BANKROLL:,.2f}  |  Kelly fraction: {KELLY_FRACTION:.0%}  |  Max single bet: {MAX_BET_PCT:.0%}")
+print()
 
 strong = [g for g in game_results if g['edge'] >= 0.15]
 good   = [g for g in game_results if 0.09 <= g['edge'] < 0.15]
 lean   = [g for g in game_results if 0.05 <= g['edge'] < 0.09]
 skip   = [g for g in game_results if g['edge'] < 0.05]
 
+total_kelly = 0
 if strong:
     print("  🔥 STRONG BETS  (bet these — highest confidence)")
     for g in strong:
-        print(f"     • {g['pick_name']} ML  →  {g['pick_prob']:.1%}  ({prob_to_american(g['pick_prob'])})")
+        total_kelly += g['kelly_amt']
+        print(f"     • {g['pick_name']} ML  →  {g['pick_prob']:.1%}  ({g['pick_odds']})  Kelly: ${g['kelly_amt']:,.2f}")
     print()
-
 if good:
     print("  ✅ GOOD BETS  (solid plays, slightly less edge)")
     for g in good:
-        print(f"     • {g['pick_name']} ML  →  {g['pick_prob']:.1%}  ({prob_to_american(g['pick_prob'])})")
+        total_kelly += g['kelly_amt']
+        print(f"     • {g['pick_name']} ML  →  {g['pick_prob']:.1%}  ({g['pick_odds']})  Kelly: ${g['kelly_amt']:,.2f}")
     print()
-
 if lean:
     print("  👀 LEAN  (small plays only or parlays)")
     for g in lean:
-        print(f"     • {g['pick_name']} ML  →  {g['pick_prob']:.1%}  ({prob_to_american(g['pick_prob'])})")
+        print(f"     • {g['pick_name']} ML  →  {g['pick_prob']:.1%}  ({g['pick_odds']})")
     print()
-
 if skip:
     print("  ⚠️  SKIP THESE  (model has no edge)")
     for g in skip:
         print(f"     • {g['away_name']} @ {g['home_name']}  (too close to call)")
     print()
 
-# Best prop pick of the night
+if total_kelly > 0:
+    print(f"  💰 TOTAL RECOMMENDED ACTION : ${total_kelly:,.2f}  ({total_kelly/BANKROLL:.1%} of bankroll)")
+    print()
+
 if all_safe_props:
-    best_prop = max(all_safe_props, key=lambda x: x['hit_rate'])
-    conf, stars = prop_confidence(best_prop['hit_rate'])
+    bp = max(all_safe_props, key=lambda x: x['hit_rate'])
     print(f"  🎯 BEST PLAYER PROP TONIGHT:")
-    print(f"     {best_prop['player']}  {best_prop['label']}")
-    print(f"     {best_prop['hit_rate']:.0%} hit rate  (avg {best_prop['avg']:.1f} over last {best_prop['n_games']} games)")
+    print(f"     {bp['player']}  {bp['label']}")
+    print(f"     {bp['hit_rate']:.0%} hit rate  (avg {bp['avg']:.1f} / last {bp['n_games']} games)  {bp['trend']}")
     print()
 
-# Best team parlay
-parlay_pool = [g for g in game_results if g['edge'] >= 0.05]
-top_team_parlay = None
-if len(parlay_pool) >= 2:
-    best_2leg = sorted(
-        [{'legs': c, 'combined': parlay_prob([x['pick_prob'] for x in c]),
-          'payout': parlay_payout([x['pick_prob'] for x in c])}
-         for c in itertools.combinations(parlay_pool, 2)],
-        key=lambda x: x['combined'] * np.log1p(x['payout']),
-        reverse=True
+pool = [g for g in game_results if g['edge'] >= 0.05]
+if len(pool) >= 2:
+    best2 = sorted(
+        [{'legs':c,'combined':parlay_prob([x['pick_prob'] for x in c]),
+          'payout':parlay_payout([x['pick_prob'] for x in c])}
+         for c in itertools.combinations(pool, 2)],
+        key=lambda x: x['combined'] * np.log1p(x['payout']), reverse=True
     )
-    if best_2leg:
-        top_team_parlay = best_2leg[0]
-        legs_str = "  +  ".join([f"{g['pick_name']}" for g in top_team_parlay['legs']])
+    if best2:
+        tp  = best2[0]
+        k   = kelly_bet(tp['combined'], prob_to_american(tp['combined']), BANKROLL)
+        lgs = "  +  ".join(g['pick_name'] for g in tp['legs'])
         print(f"  BEST TEAM PARLAY:")
-        print(f"     {legs_str}")
-        print(f"     {top_team_parlay['combined']:.1%} hit chance  →  ${top_team_parlay['payout']:,.2f} on $100")
-    print()
+        print(f"     {lgs}")
+        print(f"     {tp['combined']:.1%} hit chance  →  ${tp['payout']:,.2f} on $100  (Kelly: ${k:,.2f})")
+        print()
 
-# Best safe prop parlay
 if safe_parlays:
-    best_sp = safe_parlays[0]
-    legs_str = "  +  ".join([f"{p['player']} {p['label']}" for p in best_sp['legs']])
+    sp  = safe_parlays[0]
+    lgs = "  +  ".join(f"{p['player']} {p['label']}" for p in sp['legs'])
     print(f"  BEST PROP PARLAY:")
-    print(f"     {legs_str}")
-    print(f"     {best_sp['combined']:.1%} hit chance  →  ${best_sp['payout']:,.2f} on $100")
+    print(f"     {lgs}")
+    print(f"     {sp['combined']:.1%} hit chance  →  ${sp['payout']:,.2f} on $100")
     print()
 
-# Best risky prop
 if risky_parlays:
-    best_rp = risky_parlays[0]
-    legs_str = "  +  ".join([f"{p['player']} {p['label']}" for p in best_rp['legs']])
+    rp  = risky_parlays[0]
+    lgs = "  +  ".join(f"{p['player']} {p['label']}" for p in rp['legs'])
     print(f"  💣 BEST RISKY PARLAY (long shot):")
-    print(f"     {legs_str}")
-    print(f"     {best_rp['combined']:.1%} hit chance  →  ${best_rp['payout']:,.2f} on $100")
+    print(f"     {lgs}")
+    print(f"     {rp['combined']:.1%} hit chance  →  ${rp['payout']:,.2f} on $100")
+    print(f"     ⚠️  Cap this at $10-20 max")
     print()
 
 print("═" * 60)
-print(f"  Model accuracy : {acc:.1%}  |  Edge over book : {(acc-0.524)*100:+.1f}pp")
-print(f"  Games trained  : {len(X_train):,}  |  Features : {len(feature_cols)}")
-print(f"  Predictions    : {len(game_results)} games tonight")
-print(f"  Player props   : {len(all_safe_props)} safe  |  {len(all_risky_props)} risky analyzed")
+print(f"  Model        : Ensemble (XGBoost 60% + Random Forest 40%)")
+print(f"  Accuracy     : {acc:.1%}  |  Edge over book : {(acc-0.524)*100:+.1f}pp")
+print(f"  Log-loss     : {ll:.4f}  (calibration quality)")
+print(f"  Features     : {len(feature_cols)}")
+print(f"  Games trained: {len(X_train):,}")
+print(f"  Predictions  : {len(game_results)} games tonight")
+print(f"  Props        : {len(all_safe_props)} safe  |  {len(all_risky_props)} risky")
+print(f"  Cache        : {'HIT — skipped retraining' if cache_valid else 'MISS — retrained & saved'}")
 print("═" * 60)
 print()
 print("  HOW TO USE:")
-print("  1. Copy STRONG BET picks to Bet365 / DraftKings")
-print("  2. Use SAFE PROP PARLAY #1 for steady gains")
-print("  3. Drop $10-20 max on RISKY PARLAYS for big upside")
-print("  4. MIXED PARLAYS combine ML + props for value")
-print("  5. Run this script every night before games tip off")
-print("  6. Only bet what you can afford to lose")
+print("  1. Set BANKROLL at the top of this file to your actual bankroll")
+print("  2. Copy STRONG BET + Kelly amounts to DraftKings / Bet365")
+print("  3. SAFE PROP PARLAY #1 = best steady-value play")
+print("  4. Drop $10-20 MAX on RISKY PARLAYS (long shots only)")
+print("  5. HOT STREAK parlays = players trending up, look for value")
+print("  6. Second run today is instant — model cached, no retraining")
+print("  7. Delete model_cache.pkl weekly to force a full retrain")
+print("  8. Never bet more than you can afford to lose")
 print()
