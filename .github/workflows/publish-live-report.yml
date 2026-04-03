@@ -1,0 +1,63 @@
+# Builds real JSON from nba_predictor.py and publishes it to branch `report-data`
+# so Vercel can set ROLI_REPORT_URL to:
+#   https://raw.githubusercontent.com/<owner>/<repo>/report-data/live-report.json
+#
+# Requires: public repo (raw URLs are anonymous) OR use another host + URL.
+name: Publish live report
+
+on:
+  workflow_dispatch:
+  schedule:
+    # ~11:00 UTC and ~23:00 UTC — adjust for when you want fresh slates (NBA day = US Eastern)
+    - cron: "0 11,23 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-live-report
+  cancel-in-progress: true
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - uses: actions/cache@v4
+        with:
+          path: nba_bot/model_cache.pkl
+          key: roli-model-${{ hashFiles('requirements.txt', 'nba_bot/nba_predictor.py') }}
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run predictor (JSON)
+        env:
+          ROLI_JSON: "1"
+          ROLI_JSON_OUT: ${{ github.workspace }}/roli-live-report.json
+        run: python nba_bot/nba_predictor.py
+
+      - name: Push live-report.json to report-data branch
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          test -f "$GITHUB_WORKSPACE/roli-live-report.json"
+          mkdir -p /tmp/roli-report-push
+          cp "$GITHUB_WORKSPACE/roli-live-report.json" /tmp/roli-report-push/live-report.json
+          cd /tmp/roli-report-push
+          git init -b report-data
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add live-report.json
+          git commit -m "chore: update live report $(date -u +%Y-%m-%dT%H:%MZ)"
+          git remote add origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git push -f origin report-data

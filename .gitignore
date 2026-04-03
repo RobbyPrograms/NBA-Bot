@@ -16,3 +16,4 @@ build/
 .next/
 node_modules/
 .rolibot_report.json
+roli-live-report.json
