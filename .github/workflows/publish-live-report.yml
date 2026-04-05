@@ -33,7 +33,7 @@ jobs:
 
       - uses: actions/cache@v4
         with:
-          path: nba_bot/model_cache.pkl
+          path: nba_bot/rolibot_cache.pkl
           key: roli-model-${{ hashFiles('requirements.txt', 'nba_bot/nba_predictor.py') }}
 
       - name: Install dependencies
