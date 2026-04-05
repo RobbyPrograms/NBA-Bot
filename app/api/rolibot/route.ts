@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { buildDevPlaceholderReport } from "@/lib/dev-placeholder-report";
 import { mockReport } from "@/lib/mock-report";
 
 export const runtime = "nodejs";
@@ -123,11 +124,28 @@ export async function GET() {
   const devOrDemoFallback =
     process.env.NODE_ENV === "development" || process.env.ROLI_DEMO_FALLBACK === "1";
   if (devOrDemoFallback) {
-    const body = {
-      ...mockReport,
-      generated_at: new Date().toISOString(),
-      brand: `${mockReport.brand} · local demo`,
-    };
+    const day = new Date().toISOString().slice(0, 10);
+    const nowIso = new Date().toISOString();
+    const fullMock = process.env.ROLI_FULL_MOCK === "1";
+
+    const body = fullMock
+      ? {
+          ...mockReport,
+          generated_at: nowIso,
+          slate_date: day,
+          is_placeholder: false,
+          pipeline: mockReport.pipeline
+            ? { ...mockReport.pipeline, slate_date: day, date_to: day }
+            : undefined,
+          brand: `${mockReport.brand} · local demo`,
+        }
+      : {
+          ...buildDevPlaceholderReport(),
+          generated_at: nowIso,
+          slate_date: day,
+          brand: "RoliBot NBA · local demo",
+        };
+
     return NextResponse.json(body, {
       headers: { ...corsHeaders, ...cacheControlHeaders() },
     });

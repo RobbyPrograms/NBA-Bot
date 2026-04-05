@@ -433,12 +433,25 @@ export default function Page() {
 
             {!usedMock && r.brand.includes("local demo") && (
               <Card className="w-full border-[var(--border)] bg-[var(--card-inner)] p-4">
-                <p className="text-sm text-[var(--muted)]">
-                  <span className="font-semibold text-[var(--text)]">Local dev</span> —{" "}
-                  <code className="font-mono text-[var(--accent)]">/api/rolibot</code> is serving the bundled sample JSON
-                  because <code className="font-mono">ROLI_REPORT_URL</code> /{" "}
-                  <code className="font-mono">ROLI_BACKEND_URL</code> are unset. Set them for real pipeline output.
-                </p>
+                {r.is_placeholder ? (
+                  <p className="text-sm leading-relaxed text-[var(--muted)]">
+                    <span className="font-semibold text-[var(--text)]">Local dev — no live JSON</span> — You’re not
+                    seeing old sample picks. The slate is empty until you point{" "}
+                    <code className="font-mono text-[var(--accent)]">ROLI_REPORT_URL</code> (or{" "}
+                    <code className="font-mono">ROLI_BACKEND_URL</code>) at real predictor output in{" "}
+                    <code className="font-mono">.env.local</code>, then restart <code className="font-mono">npm run dev</code>
+                    . For the fictional UI sample only, set{" "}
+                    <code className="font-mono">ROLI_FULL_MOCK=1</code> in <code className="font-mono">.env.local</code>.
+                  </p>
+                ) : (
+                  <p className="text-sm text-[var(--muted)]">
+                    <span className="font-semibold text-[var(--text)]">Local dev</span> —{" "}
+                    <code className="font-mono text-[var(--accent)]">ROLI_FULL_MOCK=1</code> is on:{" "}
+                    <code className="font-mono">/api/rolibot</code> serves the static sample (not necessarily
+                    today&apos;s NBA slate). Unset it and use <code className="font-mono">ROLI_REPORT_URL</code> for real
+                    picks.
+                  </p>
+                )}
               </Card>
             )}
 

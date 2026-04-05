@@ -307,4 +307,6 @@ export interface RolibotReport {
   };
   disclaimer: string;
   error?: string;
+  /** Dev API: empty slate placeholder (not fictional historical picks) */
+  is_placeholder?: boolean;
 }
