@@ -2,8 +2,11 @@ import type { RolibotReport } from "./types";
 
 export const mockReport: RolibotReport = {
   ok: true,
-  brand: "RoliBot NBA",
+  brand: "RoliBot NBA v5 (demo)",
   generated_at: new Date().toISOString().slice(0, 10),
+  slate_date: new Date().toISOString().slice(0, 10),
+  slate_matchups: ["SAS @ LAC", "MIN @ DET"],
+  llm_enabled: false,
   bankroll: 1000,
   kelly_fraction: 0.25,
   max_bet_pct: 0.05,
@@ -68,12 +71,29 @@ export const mockReport: RolibotReport = {
     games_predicted_tonight: 6,
     breakeven_note: "~52.4% implied win rate vs standard -110 sides",
   },
+  accuracy_notes: {
+    traded_skipped: 2,
+    injured_skipped: 14,
+    trade_check: "Last game log team must match roster team (hard block).",
+    injury_check: "ESPN live feed: Out / Doubtful / GTD / Questionable excluded.",
+    activity_check: "Must have played within recent window (long IR filtered).",
+    minutes_check: "Minutes floor enforced for prop viability.",
+  },
+  daily_update_instructions: {
+    windows: "Task Scheduler → python nba_predictor.py → daily 1PM ET",
+    mac_linux: "cron: 0 13 * * * cd /path && python nba_predictor.py",
+    json_mode: "ROLI_JSON=1 python nba_predictor.py",
+    backtest: "ROLI_GAME_DATE=YYYY-MM-DD python nba_predictor.py",
+    llm: "ANTHROPIC_API_KEY=... for optional Claude narratives",
+    retrain: "delete rolibot_cache.pkl then run",
+    no_github_actions_needed: true,
+  },
   model: {
-    name: "Ensemble (XGBoost 60% + Random Forest 40%)",
+    name: "Stacked Ensemble (XGBoost 45% + RF 30% + GBM 15% + LR 10%)",
     accuracy: 0.664,
     logloss: 0.6035,
     edge_vs_book_pp: 14.0,
-    n_features: 64,
+    n_features: 65,
     n_train_games: 6418,
     cache_hit: false,
   },
@@ -108,6 +128,8 @@ export const mockReport: RolibotReport = {
       confidence: "🔥 STRONG",
       stars: "★★★",
       kelly_amt: 0,
+      analysis:
+        "Demo narrative: home team efficiency edge vs opponent travel; monitor late injury news before lock (rules-based sample).",
       props: [],
       top_props: [
         {
@@ -256,12 +278,26 @@ export const mockReport: RolibotReport = {
         ],
       },
     ],
+    sgp: [
+      {
+        n: 2,
+        combined: 0.78,
+        payout: 28.2,
+        implied_american: "-355",
+        kelly: 2.1,
+        legs: [
+          { player: "James Harden", label: "15+ Points", hit_rate: 0.93, trend: "📈 WARM", team: "LAC", opp: "SAS" },
+          { player: "Kawhi Leonard", label: "5+ Rebounds", hit_rate: 0.88, trend: "🔥 HOT", team: "LAC", opp: "SAS" },
+        ],
+      },
+    ],
     risky_props: [
       {
         n: 2,
         combined: 0.207,
         payout: 382.61,
         implied_american: "+383",
+        kelly: 0.15,
         legs: [
           { player: "Devin Vassell", label: "3+ Three-Pointers", hit_rate: 0.46, trend: "🥶 COLD", avg: 2.5 },
           { player: "Stephon Castle", label: "15+ Points", hit_rate: 0.45, trend: "📈 WARM", avg: 14.1 },

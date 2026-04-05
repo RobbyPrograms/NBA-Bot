@@ -3,19 +3,25 @@ export interface PlayerProp {
   team: string;
   label: string;
   stat?: string;
-  threshold?: number;
+  threshold?: number | null;
   hit_rate: number;
-  raw_hr: number;
+  raw_hr?: number;
   avg: number;
   avg_recent: number;
+  avg_recent3?: number | null;
   std?: number | null;
   n_games: number;
   trend: string;
+  trend3?: string;
   min_flag: string;
   opp_factor: number;
   min_recent?: number | null;
   stars?: string;
   confidence_tier?: string;
+  /** v5 JSON: tier string from prop_conf */
+  confidence?: string;
+  opp?: string;
+  inj_status?: string;
 }
 
 export interface MinutesWarning {
@@ -40,10 +46,12 @@ export interface GameRow {
   confidence: string;
   stars: string;
   kelly_amt: number;
-  props: PlayerProp[];
+  props?: PlayerProp[];
   top_props?: PlayerProp[];
   risky_props?: PlayerProp[];
   minutes_warnings?: MinutesWarning[];
+  /** v5: Claude or rules-based narrative */
+  analysis?: string;
 }
 
 export interface SafeParlayLeg {
@@ -51,8 +59,10 @@ export interface SafeParlayLeg {
   label: string;
   hit_rate: number;
   trend: string;
-  stars: string;
-  confidence: string;
+  stars?: string;
+  confidence?: string;
+  team?: string;
+  opp?: string;
 }
 
 export interface SafePropParlay {
@@ -70,6 +80,8 @@ export interface RiskyParlayLeg {
   hit_rate: number;
   trend: string;
   avg?: number;
+  team?: string;
+  opp?: string;
 }
 
 export interface RiskyPropParlay {
@@ -77,6 +89,7 @@ export interface RiskyPropParlay {
   combined: number;
   payout: number;
   implied_american?: string;
+  kelly?: number;
   legs: RiskyParlayLeg[];
 }
 
@@ -105,13 +118,20 @@ export interface MixedParlay {
   kelly?: number;
   team_pick: {
     pick_name: string;
-    pick_abbr: string;
+    pick_abbr?: string;
     pick_prob: number;
-    pick_side: string;
-    stars: string;
+    pick_side?: string;
+    stars?: string;
   };
   prop: PlayerProp;
   prop2?: PlayerProp;
+}
+
+export interface BetSlipSkipRow {
+  home_name: string;
+  away_name: string;
+  home_abbr?: string;
+  away_abbr?: string;
 }
 
 export interface SeasonPullRow {
@@ -140,6 +160,9 @@ export interface InjuryReportSummary {
   source?: string;
   fetched_ok?: boolean;
   n_out?: number;
+  /** v5 */
+  n_tracked?: number;
+  n_excluded?: number;
   error?: string;
   out_players?: InjuryReportRow[];
 }
@@ -147,7 +170,7 @@ export interface InjuryReportSummary {
 export interface PipelineStats {
   season_pull?: SeasonPullRow[];
   current_nba_season?: string;
-  raw_season_rows: number;
+  raw_season_rows?: number;
   clean_merged_games: number;
   home_win_rate_merged?: number;
   date_from: string;
@@ -155,7 +178,6 @@ export interface PipelineStats {
   train_games: number;
   test_games: number;
   schedule_tonight: number;
-  /** YYYY-MM-DD passed to NBA scoreboard (Eastern game-day by default) */
   slate_date?: string;
   slate_timezone?: string;
   props_fetch?: PropsFetchRow[];
@@ -183,6 +205,45 @@ export interface CalibrationBin {
   n_games: number;
 }
 
+export interface AccuracyNotes {
+  traded_skipped?: number;
+  injured_skipped?: number;
+  trade_check?: string;
+  injury_check?: string;
+  activity_check?: string;
+  minutes_check?: string;
+}
+
+export interface DailyUpdateInstructions {
+  windows?: string;
+  mac_linux?: string;
+  json_mode?: string;
+  backtest?: string;
+  llm?: string;
+  retrain?: string;
+  no_github_actions_needed?: boolean;
+}
+
+export interface ParlaysBlock {
+  safe_props?: SafePropParlay[];
+  /** v5 */
+  safe?: SafePropParlay[];
+  risky_props?: RiskyPropParlay[];
+  risky?: RiskyPropParlay[];
+  /** v5 same-game parlays */
+  sgp?: SafePropParlay[];
+  mixed?: MixedParlay[];
+  hot?: HotPropParlay[];
+  best_team?: {
+    legs: { pick_name: string; pick_abbr: string; pick_prob: number; pick_side: string }[];
+    combined: number;
+    payout: number;
+    kelly: number;
+  } | null;
+  best_safe_prop?: SafePropParlay | null;
+  best_risky_prop?: RiskyPropParlay | null;
+}
+
 export interface RolibotReport {
   ok: boolean;
   brand: string;
@@ -191,6 +252,14 @@ export interface RolibotReport {
   kelly_fraction: number;
   max_bet_pct: number;
   how_to_use?: string[];
+  /** v5 slate (also may live under pipeline in older JSON) */
+  slate_date?: string;
+  /** Exact AWAY @ HOME strings used for props (from scoreboard) */
+  slate_matchups?: string[];
+  llm_enabled?: boolean;
+  injury_report?: InjuryReportSummary;
+  accuracy_notes?: AccuracyNotes;
+  daily_update_instructions?: DailyUpdateInstructions;
   pipeline?: PipelineStats;
   training?: TrainingMeta;
   run_meta?: RunMeta;
@@ -198,9 +267,11 @@ export interface RolibotReport {
     name: string;
     accuracy: number;
     logloss: number;
-    edge_vs_book_pp: number;
+    edge_vs_book_pp?: number;
+    edge_pp?: number;
     n_features: number;
-    n_train_games: number;
+    n_train_games?: number;
+    n_train?: number;
     cache_hit: boolean;
   };
   evaluation?: {
@@ -213,29 +284,17 @@ export interface RolibotReport {
     strong: GameRow[];
     good: GameRow[];
     lean: GameRow[];
-    skip: { home_name: string; away_name: string; home_abbr: string; away_abbr: string }[];
+    skip: BetSlipSkipRow[];
     total_kelly: number;
     total_kelly_pct_bankroll?: number;
   };
-  parlays: {
-    safe_props: SafePropParlay[];
-    risky_props: RiskyPropParlay[];
-    mixed: MixedParlay[];
-    hot: HotPropParlay[];
-    best_team: {
-      legs: { pick_name: string; pick_abbr: string; pick_prob: number; pick_side: string }[];
-      combined: number;
-      payout: number;
-      kelly: number;
-    } | null;
-    best_safe_prop: SafePropParlay | null;
-    best_risky_prop: RiskyPropParlay | null;
-  };
+  parlays: ParlaysBlock;
   highlights?: {
     best_prop_parlay_kelly: number;
   };
   props_summary: {
-    n_safe: number;
+    n_safe?: number;
+    n_strong?: number;
     n_risky: number;
     best_prop: {
       player: string;

@@ -57,14 +57,12 @@ export default function HowItWorksPage() {
             training frame always grows with the calendar — not a fixed &quot;2018–2025&quot; cap.
           </p>
           <p className="text-[var(--muted)] leading-relaxed">
-            Each API/CLI run embeds a per-season row audit in the JSON at{" "}
+            Richer runs may embed a per-season audit under{" "}
             <code className="rounded bg-[var(--card-inner)] px-1.5 py-0.5 font-mono text-xs text-[var(--accent)]">
               pipeline.season_pull
-            </code>
-            , plus <code className="font-mono text-xs text-[var(--accent)]">date_from</code>,{" "}
-            <code className="font-mono text-xs text-[var(--accent)]">date_to</code>, and{" "}
-            <code className="font-mono text-xs text-[var(--accent)]">current_nba_season</code> for props — use that if
-            you need the full table off the main dashboard.
+            </code>{" "}
+            (older JSON). The v5 CLI JSON is slimmer: slate date, injury snapshot, accuracy guardrails, and parlay
+            blocks are at the root — the dashboard reads both shapes.
           </p>
         </section>
 
@@ -80,17 +78,26 @@ export default function HowItWorksPage() {
               20% holdout (no random shuffle leakage).
             </li>
             <li>
-              <strong className="text-[var(--text)]">Ensemble:</strong> XGBoost + Random Forest, each{" "}
-              <strong className="text-[var(--text)]">probability-calibrated</strong> (isotonic), then blended 60/40.
+              <strong className="text-[var(--text)]">Ensemble (v5):</strong> four calibrated models — XGBoost, Random
+              Forest, Gradient Boosting, Logistic Regression — blended at 45% / 30% / 15% / 10%.
             </li>
             <li>
-              <strong className="text-[var(--text)]">Cache:</strong> a content fingerprint of the training matrix
-              decides whether to reload weights from <code className="font-mono text-xs">model_cache.pkl</code> or
-              retrain.
+              <strong className="text-[var(--text)]">Features (v5):</strong> ~65 rolling team signals including
+              multi-window momentum (3 / 5 / 10 games) and variance-style cues so unstable teams are distinguishable from
+              steady ones.
             </li>
             <li>
-              <strong className="text-[var(--text)]">Evaluation:</strong> holdout accuracy, log-loss, classification
-              report, and binned calibration curves — all surfaced on the main dashboard after each run.
+              <strong className="text-[var(--text)]">Cache:</strong> fingerprinted training data; cache hit skips full
+              retrain (see JSON <code className="font-mono text-xs">model.cache_hit</code>).
+            </li>
+            <li>
+              <strong className="text-[var(--text)]">Evaluation:</strong> when the JSON includes them, holdout accuracy,
+              log-loss, and calibration bins appear on the dashboard; v5 runs may omit the full evaluation block.
+            </li>
+            <li>
+              <strong className="text-[var(--text)]">LLM layer (optional):</strong> with{" "}
+              <code className="font-mono text-xs">ANTHROPIC_API_KEY</code>, short per-game narratives can augment the
+              rules-based output; without a key the pipeline still runs.
             </li>
           </ul>
         </section>
@@ -101,9 +108,12 @@ export default function HowItWorksPage() {
             Props use <code className="font-mono text-xs text-[var(--accent)]">PlayerGameLog</code> for the current NBA
             season (with a previous-season merge early in the year when sample size is thin). Hit rates blend recent
             games heavier than older ones; opponent defensive context nudges scoring lines.{" "}
-            <strong className="text-[var(--text)]">Players listed Out</strong> on ESPN&apos;s public injury JSON are
-            stripped from prop and parlay pools so the model doesn&apos;t surface obvious DNPs. Parlay hit probabilities
-            multiply single-leg estimates (independence shortcut — real books price same-game correlation).
+            <strong className="text-[var(--text)]">Injuries:</strong> ESPN-style feed with tighter name matching; Out,
+            Doubtful, GTD, Questionable, and similar statuses are excluded from props.{" "}
+            <strong className="text-[var(--text)]">Traded players:</strong> recent game logs must align with the roster
+            team or the player is skipped. <strong className="text-[var(--text)]">Activity:</strong> very stale game
+            activity is filtered so long-term IR doesn&apos;t slip through. Same-game parlays (SGP) are listed separately;
+            hit probabilities still multiply legs (books price correlation).
           </p>
         </section>
 

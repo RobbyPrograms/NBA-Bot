@@ -5,6 +5,19 @@ import { useCallback, useEffect, useState } from "react";
 import type { GameRow, HotPropParlay, MixedParlay, RolibotReport, RiskyPropParlay, SafePropParlay } from "@/lib/types";
 import { mockReport } from "@/lib/mock-report";
 import {
+  firstRiskyParlay,
+  firstSafeParlay,
+  injurySummary,
+  modelEdgePp,
+  modelNTrain,
+  parlayHotList,
+  parlayRiskyList,
+  parlaySafeList,
+  parlaySgpList,
+  propsNSafe,
+  slateDateDisplay,
+} from "@/lib/report-helpers";
+import {
   Card,
   NavHowItWorks,
   PageBackdrop,
@@ -57,6 +70,16 @@ function GamePredictionCard({ g }: { g: GameRow }) {
         </p>
       )}
 
+      {g.analysis != null && g.analysis.trim() !== "" && (
+        <div className="mt-4 rounded-xl border border-[var(--border)] bg-[var(--card-inner)] p-3">
+          <p className="text-[11px] font-semibold uppercase tracking-wide text-[var(--muted)]">Game analysis</p>
+          <p className="mt-2 text-sm leading-relaxed text-[var(--text)]">{g.analysis}</p>
+          <p className="mt-2 text-[11px] text-[var(--muted)]">
+            Rules-based or LLM narrative from the pipeline (not a sportsbook line).
+          </p>
+        </div>
+      )}
+
       {top.length > 0 && (
         <div className="mt-5 border-t border-[var(--border)] pt-4">
           <p className="text-[11px] font-semibold uppercase tracking-wide text-[var(--muted)]">
@@ -77,9 +100,18 @@ function GamePredictionCard({ g }: { g: GameRow }) {
                 </div>
                 <div className="text-[13px] text-[var(--muted)]">
                   {p.stars ? <span>{p.stars} </span> : null}
+                  {(p.confidence_tier ?? p.confidence) ? (
+                    <span>{p.confidence_tier ?? p.confidence} </span>
+                  ) : null}
                   {p.trend ? <span>{p.trend} </span> : null}
+                  {p.trend3 ? <span>{p.trend3} </span> : null}
+                  {p.opp ? <span className="font-mono">vs {p.opp} </span> : null}
                   {Math.abs(p.opp_factor - 1) > 0.02 ? (
                     <span className="font-mono">[opp adj ×{p.opp_factor.toFixed(2)}]</span>
+                  ) : null}
+                  {p.inj_status ? <span className="block text-[11px]">Inj: {p.inj_status}</span> : null}
+                  {p.avg_recent3 != null ? (
+                    <span className="block font-mono text-[11px]">L3 avg {p.avg_recent3.toFixed(1)}</span>
                   ) : null}
                 </div>
               </li>
@@ -164,6 +196,12 @@ function SafeParlayCard({ p, i }: { p: SafePropParlay; i: number }) {
                 {leg.stars ? <span>{leg.stars} </span> : null}
                 {leg.confidence ? <span>{leg.confidence} </span> : null}
                 {leg.trend ? <span>{leg.trend}</span> : null}
+                {leg.team != null && leg.team !== "" ? (
+                  <span className="ml-1 font-mono text-[11px]">{leg.team}</span>
+                ) : null}
+                {leg.opp != null && leg.opp !== "" ? (
+                  <span className="ml-1 font-mono text-[11px] text-[var(--muted)]">vs {leg.opp}</span>
+                ) : null}
               </div>
             </li>
           ))}
@@ -182,6 +220,9 @@ function RiskyParlayCard({ p, i }: { p: RiskyPropParlay; i: number }) {
         {p.n}-leg · {pct(p.combined)} · ~${p.payout} / $100
         {p.implied_american ? ` · ${p.implied_american}` : ""}
       </p>
+      {p.kelly != null && p.kelly > 0 && (
+        <p className="mt-1 font-mono text-xs text-[var(--accent)]">Kelly bet size ${p.kelly.toFixed(2)}</p>
+      )}
       <div className="mt-3 border-t border-[var(--border)] pt-3">
         <ParlayLegMismatch declared={p.n} actual={nLegs} />
         <ul className="space-y-3">
@@ -202,6 +243,12 @@ function RiskyParlayCard({ p, i }: { p: RiskyPropParlay; i: number }) {
                 </span>
               </div>
               {leg.trend ? <div className="mt-0.5 text-[13px] text-[var(--muted)]">{leg.trend}</div> : null}
+              {leg.team != null && leg.team !== "" ? (
+                <div className="mt-0.5 font-mono text-[11px] text-[var(--muted)]">
+                  {leg.team}
+                  {leg.opp != null && leg.opp !== "" ? ` vs ${leg.opp}` : ""}
+                </div>
+              ) : null}
             </li>
           ))}
         </ul>
@@ -250,11 +297,15 @@ function HotParlayCard({ p, i }: { p: HotPropParlay; i: number }) {
 }
 
 function MixedParlayCard({ m, i }: { m: MixedParlay; i: number }) {
+  const side = m.team_pick.pick_side;
+  const stars = m.team_pick.stars;
   return (
     <Card className="w-full p-5">
       <p className="font-mono text-[11px] text-[var(--muted)]">Mixed #{i + 1}</p>
       <p className="mt-2 text-sm text-[var(--text)]">
-        {m.team_pick.pick_name} ({m.team_pick.pick_side}) {pct(m.team_pick.pick_prob)} {m.team_pick.stars}
+        {m.team_pick.pick_name}
+        {side != null && side !== "" ? ` (${side})` : ""} {pct(m.team_pick.pick_prob)}
+        {stars != null && stars !== "" ? ` ${stars}` : ""}
       </p>
       <p className="mt-1 text-sm text-[var(--muted)]">
         ▸ {m.prop.player} — {m.prop.label} {pct(m.prop.hit_rate)}
@@ -268,7 +319,7 @@ function MixedParlayCard({ m, i }: { m: MixedParlay; i: number }) {
       )}
       <p className="mt-3 font-mono text-xs text-[var(--muted)]">
         Combined {pct(m.combined)} · ~${m.payout} / $100
-        {m.implied_american ? ` · ${m.implied_american}` : ""}
+        {m.implied_american != null && m.implied_american !== "" ? ` · ${m.implied_american}` : ""}
         {m.kelly != null && m.kelly > 0 ? ` · Kelly $${m.kelly.toFixed(2)}` : ""}
       </p>
     </Card>
@@ -398,6 +449,23 @@ export default function Page() {
                   Bankroll ${r.bankroll.toLocaleString(undefined, { minimumFractionDigits: 2 })} · Kelly{" "}
                   {pct(r.kelly_fraction)} · Max bet {pct(r.max_bet_pct)}
                 </p>
+                <div className="mt-3 flex flex-wrap gap-2">
+                  {typeof r.llm_enabled === "boolean" &&
+                    (r.llm_enabled ? (
+                      <span className="rounded-full border border-[var(--accent-2)]/40 bg-[var(--accent-2)]/10 px-2.5 py-0.5 text-[11px] font-medium text-[var(--accent-2)]">
+                        LLM analysis on
+                      </span>
+                    ) : (
+                      <span className="rounded-full border border-[var(--border)] px-2.5 py-0.5 text-[11px] text-[var(--muted)]">
+                        LLM off — set ANTHROPIC_API_KEY for Claude narratives
+                      </span>
+                    ))}
+                  {slateDateDisplay(r) != null && (
+                    <span className="rounded-full border border-[var(--border)] px-2.5 py-0.5 font-mono text-[11px] text-[var(--muted)]">
+                      Slate {slateDateDisplay(r)}
+                    </span>
+                  )}
+                </div>
                 <p className="mt-auto pt-4 text-sm text-[var(--muted)]">Generated {r.generated_at}</p>
               </Card>
               <Card className="flex min-h-[140px] flex-col justify-center p-6">
@@ -436,10 +504,11 @@ export default function Page() {
                     r.evaluation?.sportsbook_breakeven != null ? pct(r.evaluation.sportsbook_breakeven) : "~52.4%"
                   }
                 />
-                <StatTile label="Edge vs breakeven" value={`+${r.model.edge_vs_book_pp.toFixed(1)} pp`} />
+                <StatTile label="Edge vs breakeven" value={`+${modelEdgePp(r).toFixed(1)} pp`} />
               </div>
               <p className="text-sm text-[var(--muted)]">
-                Classification breakdown, calibration bins, XGBoost validation curves, and train/cache behavior live on{" "}
+                Classification breakdown, calibration bins, validation curves, and train/cache behavior (when present in
+                JSON) are described on{" "}
                 <Link href="/how-it-works" className="font-medium text-[var(--accent)] underline-offset-2 hover:underline">
                   How it works
                 </Link>
@@ -447,18 +516,181 @@ export default function Page() {
               </p>
             </section>
 
-            {pipe && (
+            {(pipe != null || slateDateDisplay(r) != null) && (
               <section className="w-full space-y-4">
                 <SectionHeading>Tonight&apos;s schedule</SectionHeading>
                 <p className="text-sm text-[var(--muted)]">
                   Scoreboard date follows NBA game-day (US Eastern by default), not your PC clock — see slate date below.
                 </p>
                 <div className="grid w-full grid-cols-2 gap-3 lg:grid-cols-4">
-                  <StatTile label="Games on slate" value={String(pipe.schedule_tonight)} />
-                  {pipe.slate_date ? (
-                    <StatTile label="Slate date (ET)" value={pipe.slate_date} />
+                  <StatTile
+                    label="Games on slate"
+                    value={String(pipe?.schedule_tonight ?? r.games.length)}
+                  />
+                  {slateDateDisplay(r) != null ? (
+                    <StatTile label="Slate date" value={slateDateDisplay(r)!} />
+                  ) : null}
+                  {pipe?.slate_timezone != null && pipe.slate_timezone !== "" ? (
+                    <StatTile label="Slate TZ" value={pipe.slate_timezone} />
                   ) : null}
                 </div>
+                {r.slate_matchups != null && r.slate_matchups.length > 0 && (
+                  <Card className="w-full p-4">
+                    <p className="text-[11px] font-semibold uppercase tracking-wide text-[var(--muted)]">
+                      Teams in this run (props only from these games)
+                    </p>
+                    <ul className="mt-2 space-y-1 font-mono text-sm text-[var(--text)]">
+                      {r.slate_matchups.map((line) => (
+                        <li key={line}>{line}</li>
+                      ))}
+                    </ul>
+                    <p className="mt-3 text-xs text-[var(--muted)]">
+                      If this list doesn&apos;t match what your book shows for &quot;tonight,&quot; the report may be
+                      stale (regenerate JSON), the slate date may differ from your timezone, or finished games may have
+                      been omitted (see predictor env <code className="font-mono">ROLI_SCOREBOARD_SKIP_FINAL</code>).
+                    </p>
+                  </Card>
+                )}
+              </section>
+            )}
+
+            {r.accuracy_notes != null && (
+              <section className="w-full space-y-4">
+                <SectionHeading>Accuracy guardrails</SectionHeading>
+                <p className="text-sm text-[var(--muted)]">
+                  Hard filters applied before props and parlays surface (traded players, injuries, activity, minutes).
+                </p>
+                <Card className="w-full space-y-3 p-5">
+                  <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+                    {r.accuracy_notes.traded_skipped != null && (
+                      <StatTile label="Traded / team skips" value={String(r.accuracy_notes.traded_skipped)} />
+                    )}
+                    {r.accuracy_notes.injured_skipped != null && (
+                      <StatTile label="Injury skips" value={String(r.accuracy_notes.injured_skipped)} />
+                    )}
+                  </div>
+                  <ul className="space-y-2 text-sm text-[var(--muted)]">
+                    {r.accuracy_notes.trade_check != null && r.accuracy_notes.trade_check !== "" && (
+                      <li>
+                        <span className="font-medium text-[var(--text)]">Roster vs logs: </span>
+                        {r.accuracy_notes.trade_check}
+                      </li>
+                    )}
+                    {r.accuracy_notes.injury_check != null && r.accuracy_notes.injury_check !== "" && (
+                      <li>
+                        <span className="font-medium text-[var(--text)]">Injuries: </span>
+                        {r.accuracy_notes.injury_check}
+                      </li>
+                    )}
+                    {r.accuracy_notes.activity_check != null && r.accuracy_notes.activity_check !== "" && (
+                      <li>
+                        <span className="font-medium text-[var(--text)]">Activity: </span>
+                        {r.accuracy_notes.activity_check}
+                      </li>
+                    )}
+                    {r.accuracy_notes.minutes_check != null && r.accuracy_notes.minutes_check !== "" && (
+                      <li>
+                        <span className="font-medium text-[var(--text)]">Minutes: </span>
+                        {r.accuracy_notes.minutes_check}
+                      </li>
+                    )}
+                  </ul>
+                </Card>
+              </section>
+            )}
+
+            {injurySummary(r) != null && (
+              <section className="w-full space-y-4">
+                <SectionHeading>Injury feed snapshot</SectionHeading>
+                <p className="text-sm text-[var(--muted)]">
+                  Live JSON may attach this at the root or under <code className="font-mono text-xs">pipeline</code>.
+                </p>
+                <div className="grid w-full grid-cols-2 gap-3 lg:grid-cols-4">
+                  {injurySummary(r)!.n_tracked != null && (
+                    <StatTile label="Players tracked" value={String(injurySummary(r)!.n_tracked)} />
+                  )}
+                  {(injurySummary(r)!.n_excluded != null || injurySummary(r)!.n_out != null) && (
+                    <StatTile
+                      label="Excluded from props"
+                      value={String(injurySummary(r)!.n_excluded ?? injurySummary(r)!.n_out)}
+                    />
+                  )}
+                  <StatTile
+                    label="Feed OK"
+                    value={injurySummary(r)!.fetched_ok === true ? "Yes" : injurySummary(r)!.fetched_ok === false ? "No" : "—"}
+                  />
+                </div>
+                {injurySummary(r)!.out_players != null && injurySummary(r)!.out_players!.length > 0 && (
+                  <Card className="max-h-72 w-full overflow-auto p-0">
+                    <table className="w-full text-left text-sm">
+                      <thead>
+                        <tr className="sticky top-0 border-b border-[var(--border)] bg-[var(--card-inner)] roli-table-head">
+                          <th className="px-4 py-2">Player</th>
+                          <th className="px-4 py-2">Team</th>
+                          <th className="px-4 py-2">Status</th>
+                        </tr>
+                      </thead>
+                      <tbody className="text-[var(--text)]">
+                        {injurySummary(r)!.out_players!.map((row, idx) => (
+                          <tr key={`${row.player}-${idx}`} className="border-b border-[var(--border)]">
+                            <td className="px-4 py-2">{row.player}</td>
+                            <td className="px-4 py-2 text-[var(--muted)]">{row.team}</td>
+                            <td className="px-4 py-2 font-mono text-xs">{row.status}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </Card>
+                )}
+              </section>
+            )}
+
+            {r.daily_update_instructions != null && (
+              <section className="w-full space-y-4">
+                <SectionHeading>CLI &amp; scheduling</SectionHeading>
+                <Card className="w-full space-y-3 p-5">
+                  <p className="text-sm text-[var(--muted)]">
+                    From the predictor run — local Task Scheduler / cron replaces CI if you prefer.
+                  </p>
+                  <ul className="space-y-2 font-mono text-xs leading-relaxed text-[var(--text)]">
+                    {r.daily_update_instructions.windows != null && r.daily_update_instructions.windows !== "" && (
+                      <li>
+                        <span className="text-[var(--muted)]">Windows: </span>
+                        {r.daily_update_instructions.windows}
+                      </li>
+                    )}
+                    {r.daily_update_instructions.mac_linux != null && r.daily_update_instructions.mac_linux !== "" && (
+                      <li>
+                        <span className="text-[var(--muted)]">Mac/Linux: </span>
+                        {r.daily_update_instructions.mac_linux}
+                      </li>
+                    )}
+                    {r.daily_update_instructions.json_mode != null && r.daily_update_instructions.json_mode !== "" && (
+                      <li>
+                        <span className="text-[var(--muted)]">JSON: </span>
+                        {r.daily_update_instructions.json_mode}
+                      </li>
+                    )}
+                    {r.daily_update_instructions.backtest != null && r.daily_update_instructions.backtest !== "" && (
+                      <li>
+                        <span className="text-[var(--muted)]">Backtest: </span>
+                        {r.daily_update_instructions.backtest}
+                      </li>
+                    )}
+                    {r.daily_update_instructions.llm != null && r.daily_update_instructions.llm !== "" && (
+                      <li>
+                        <span className="text-[var(--muted)]">LLM: </span>
+                        {r.daily_update_instructions.llm}
+                      </li>
+                    )}
+                    {r.daily_update_instructions.retrain != null && r.daily_update_instructions.retrain !== "" && (
+                      <li>
+                        <span className="text-[var(--muted)]">Retrain: </span>
+                        {r.daily_update_instructions.retrain}
+                      </li>
+                    )}
+                  </ul>
+                </Card>
               </section>
             )}
 
@@ -551,7 +783,7 @@ export default function Page() {
                                     <td className="py-2.5 pr-3 text-[var(--muted)]">{p.label}</td>
                                     <td className="py-2.5 pr-3 font-mono text-sm text-[var(--accent)]">{pct(p.hit_rate)}</td>
                                     <td className="py-2.5 text-[13px] text-[var(--muted)]">
-                                      {[p.stars, p.trend, p.confidence_tier].filter(Boolean).join(" · ")}
+                                      {[p.stars, p.trend, p.confidence_tier ?? p.confidence].filter(Boolean).join(" · ")}
                                       {Math.abs(p.opp_factor - 1) > 0.02 ? (
                                         <span className="ml-1 font-mono">opp ×{p.opp_factor.toFixed(2)}</span>
                                       ) : null}
@@ -605,50 +837,63 @@ export default function Page() {
                   Leg probabilities multiply (independence shortcut); sportsbooks price same-game correlation.
                 </p>
               </div>
-              {r.parlays.safe_props.length > 0 && (
+              {parlaySafeList(r).length > 0 && (
                 <div className="space-y-3">
                   <p className="text-[11px] font-semibold uppercase tracking-[0.2em] text-[var(--accent)]">
                     Safe (high hit rate)
                   </p>
                   <div className="grid w-full grid-cols-1 gap-4 md:grid-cols-2">
-                    {r.parlays.safe_props.map((p, i) => (
+                    {parlaySafeList(r).map((p, i) => (
                       <SafeParlayCard key={i} p={p} i={i} />
                     ))}
                   </div>
                 </div>
               )}
-              {r.parlays.risky_props.length > 0 && (
+              {parlaySgpList(r).length > 0 && (
+                <div className="space-y-3">
+                  <p className="text-[11px] font-semibold uppercase tracking-[0.2em] text-[var(--accent-2)]">
+                    Same-game parlays (SGP)
+                  </p>
+                  <p className="text-xs text-[var(--muted)]">All legs from one matchup; still assumes leg independence in the math.</p>
+                  <div className="grid w-full grid-cols-1 gap-4 md:grid-cols-2">
+                    {parlaySgpList(r).map((p, i) => (
+                      <SafeParlayCard key={`sgp-${i}`} p={p} i={i} />
+                    ))}
+                  </div>
+                </div>
+              )}
+              {parlayRiskyList(r).length > 0 && (
                 <div className="space-y-3">
                   <p className="text-[11px] font-semibold uppercase tracking-[0.2em] text-[var(--gold)]">
                     Risky (long shots)
                   </p>
                   <div className="grid w-full grid-cols-1 gap-4 md:grid-cols-2">
-                    {r.parlays.risky_props.map((p, i) => (
+                    {parlayRiskyList(r).map((p, i) => (
                       <RiskyParlayCard key={i} p={p} i={i} />
                     ))}
                   </div>
                 </div>
               )}
-              {r.parlays.mixed.length > 0 && (
+              {(r.parlays.mixed ?? []).length > 0 && (
                 <div className="space-y-3">
                   <p className="text-[11px] font-semibold uppercase tracking-[0.2em] text-[var(--accent-2)]">
                     Mixed (ML + props)
                   </p>
                   <div className="grid w-full grid-cols-1 gap-4 md:grid-cols-2">
-                    {r.parlays.mixed.map((m, i) => (
+                    {(r.parlays.mixed ?? []).map((m, i) => (
                       <MixedParlayCard key={i} m={m} i={i} />
                     ))}
                   </div>
                 </div>
               )}
-              {r.parlays.hot.length > 0 && (
+              {parlayHotList(r).length > 0 && (
                 <div className="space-y-3">
                   <p className="text-[11px] font-semibold uppercase tracking-[0.2em] text-[var(--accent-2)]">
                     Hot streak specials
                   </p>
                   <p className="text-xs text-[var(--muted)]">Recent form vs season baseline.</p>
                   <div className="grid w-full grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
-                    {r.parlays.hot.map((p, i) => (
+                    {parlayHotList(r).map((p, i) => (
                       <HotParlayCard key={i} p={p} i={i} />
                     ))}
                   </div>
@@ -700,7 +945,7 @@ export default function Page() {
                     <p className="text-[11px] font-semibold uppercase tracking-wider text-[var(--muted)]">Skip</p>
                     <ul className="mt-2 space-y-1 text-sm text-[var(--muted)]">
                       {r.bet_slip.skip.map((g) => (
-                        <li key={g.home_abbr + g.away_abbr}>
+                        <li key={`${g.home_name}-${g.away_name}`}>
                           {g.away_name} @ {g.home_name} (too close)
                         </li>
                       ))}
@@ -730,7 +975,7 @@ export default function Page() {
                   </p>
                 </Card>
               )}
-              {r.parlays.best_team && (
+              {r.parlays.best_team != null && (
                 <Card className="p-6">
                   <SectionTitle>Best team parlay</SectionTitle>
                   <p className="mt-3 text-[var(--text)]">{r.parlays.best_team.legs.map((l) => l.pick_name).join(" + ")}</p>
@@ -740,31 +985,42 @@ export default function Page() {
                   </p>
                 </Card>
               )}
-              {r.parlays.best_safe_prop && (
+              {firstSafeParlay(r) != null && (
                 <Card className="p-6 md:col-span-2">
                   <SectionTitle>Best prop parlay</SectionTitle>
                   <p className="mt-3 text-sm text-[var(--text)]">
-                    {r.parlays.best_safe_prop.legs.map((l) => `${l.player} ${l.label}`).join(" · ")}
+                    {firstSafeParlay(r)!.legs.map((l) => `${l.player} ${l.label}`).join(" · ")}
                   </p>
                   <p className="mt-2 font-mono text-sm text-[var(--muted)]">
-                    {pct(r.parlays.best_safe_prop.combined)} · ${r.parlays.best_safe_prop.payout} / $100
-                    {r.highlights?.best_prop_parlay_kelly != null && r.highlights.best_prop_parlay_kelly > 0 && (
-                      <> · Kelly ${r.highlights.best_prop_parlay_kelly.toFixed(2)}</>
-                    )}
+                    {pct(firstSafeParlay(r)!.combined)} · ${firstSafeParlay(r)!.payout} / $100
+                    {(r.highlights?.best_prop_parlay_kelly != null && r.highlights.best_prop_parlay_kelly > 0) ||
+                    (firstSafeParlay(r)!.kelly != null && firstSafeParlay(r)!.kelly! > 0) ? (
+                      <>
+                        {" "}
+                        · Kelly $
+                        {(r.highlights?.best_prop_parlay_kelly ?? firstSafeParlay(r)!.kelly ?? 0).toFixed(2)}
+                      </>
+                    ) : null}
                   </p>
                 </Card>
               )}
-              {r.parlays.best_risky_prop && (
-                <Card className="p-6 md:col-span-2">
-                  <SectionTitle>Best risky parlay</SectionTitle>
-                  <p className="mt-3 text-sm text-[var(--text)]">
-                    {r.parlays.best_risky_prop.legs.map((l) => `${l.player} ${l.label}`).join(" · ")}
-                  </p>
-                  <p className="mt-2 font-mono text-sm text-[var(--muted)]">
-                    {pct(r.parlays.best_risky_prop.combined)} · ${r.parlays.best_risky_prop.payout} / $100 — cap stake
-                  </p>
-                </Card>
-              )}
+              {(() => {
+                const riskyHighlight = r.parlays.best_risky_prop ?? firstRiskyParlay(r);
+                if (riskyHighlight == null) return null;
+                return (
+                  <Card className="p-6 md:col-span-2">
+                    <SectionTitle>
+                      {r.parlays.best_risky_prop != null ? "Best risky parlay" : "Top risky parlay"}
+                    </SectionTitle>
+                    <p className="mt-3 text-sm text-[var(--text)]">
+                      {riskyHighlight.legs.map((l) => `${l.player} ${l.label}`).join(" · ")}
+                    </p>
+                    <p className="mt-2 font-mono text-sm text-[var(--muted)]">
+                      {pct(riskyHighlight.combined)} · ${riskyHighlight.payout} / $100 — cap stake
+                    </p>
+                  </Card>
+                );
+              })()}
             </section>
 
             <Card className="w-full space-y-4 border-[var(--accent-2)]/25 p-6">
@@ -772,13 +1028,13 @@ export default function Page() {
               <p className="font-mono text-xs leading-relaxed text-[var(--muted)]">
                 {r.model.name}
                 <br />
-                Accuracy {pct(r.model.accuracy)} · Edge {r.model.edge_vs_book_pp >= 0 ? "+" : ""}
-                {r.model.edge_vs_book_pp.toFixed(1)}pp · Log-loss {r.model.logloss.toFixed(4)}
+                Accuracy {pct(r.model.accuracy)} · Edge {modelEdgePp(r) >= 0 ? "+" : ""}
+                {modelEdgePp(r).toFixed(1)}pp · Log-loss {r.model.logloss.toFixed(4)}
                 <br />
-                Features {r.model.n_features} · Games trained {r.model.n_train_games.toLocaleString()} · Predictions{" "}
+                Features {r.model.n_features} · Games trained {modelNTrain(r).toLocaleString()} · Predictions{" "}
                 {run?.games_predicted_tonight ?? r.games.length} tonight
                 <br />
-                Props {r.props_summary.n_safe} safe · {r.props_summary.n_risky} risky · Cache{" "}
+                Props {propsNSafe(r)} strong/safe · {r.props_summary.n_risky} risky · Cache{" "}
                 {run?.cache_line ?? (r.model.cache_hit ? "HIT" : "MISS")}
                 <br />
                 {run?.breakeven_note}
