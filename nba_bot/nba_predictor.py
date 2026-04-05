@@ -40,9 +40,6 @@ if hasattr(sys.stdout, "reconfigure"):
         sys.stderr.reconfigure(encoding="utf-8", errors="replace")
     except: pass
 
-import matplotlib
-matplotlib.use(os.environ.get("MPLBACKEND","Agg"))
-
 from nba_api.stats.endpoints import (
     commonteamroster, leaguegamefinder,
     playergamelog, scoreboardv2, commonplayerinfo,
@@ -734,9 +731,13 @@ if not cache_valid:
     except:
         print(f"\n  4-model ensemble trained  accuracy:{acc:.1%}  logloss:{ll:.4f}\n")
 
-    # Feature importance chart
+    # Feature importance chart (optional — skip if matplotlib not installed, e.g. CI JSON runs)
     try:
+        import matplotlib
+
+        matplotlib.use(os.environ.get("MPLBACKEND", "Agg"))
         import matplotlib.pyplot as plt
+
         imp  = pd.Series(xgb_model.feature_importances_,index=FEATURE_COLS).sort_values(ascending=False)
         t15  = imp.head(15)
         fig,ax = plt.subplots(figsize=(11,7))
