@@ -43,6 +43,8 @@ jobs:
         env:
           ROLI_JSON: "1"
           ROLI_JSON_OUT: ${{ github.workspace }}/roli-live-report.json
+          # stats.nba.com is slow / flaky from GitHub IPs; override with ROLI_NBA_TIMEOUT if needed
+          ROLI_NBA_TIMEOUT: "240"
         # -u: unbuffered logs (GITHUB_ACTIONS is set by GitHub so predictor keeps stdout for progress)
         run: python -u nba_bot/nba_predictor.py
 

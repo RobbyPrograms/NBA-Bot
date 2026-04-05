@@ -91,6 +91,24 @@ _SLEEP_RETRY  = 3.5
 _SLEEP_PROP   = 1.0
 _SLEEP_ROSTER = 1.1
 
+# nba_api defaults to timeout=30; stats.nba.com often needs longer from GitHub Actions / cloud IPs
+def _nba_api_timeout_seconds():
+    raw = (os.environ.get("ROLI_NBA_TIMEOUT") or "").strip()
+    if raw:
+        try:
+            return max(30, int(raw))
+        except ValueError:
+            pass
+    if os.environ.get("GITHUB_ACTIONS", "").lower() in ("true", "1", "yes"):
+        return 180
+    return 120
+
+
+_NBA_API_TIMEOUT = _nba_api_timeout_seconds()
+_SEASON_FETCH_ATTEMPTS = (
+    6 if os.environ.get("GITHUB_ACTIONS", "").lower() in ("true", "1", "yes") else 4
+)
+
 # Injury statuses to treat as UNAVAILABLE
 # Includes GTD and questionable — better to miss a prop than bet on a limited player
 INJURY_EXCLUDE = {
@@ -284,7 +302,9 @@ def player_injury_status(name, injuries):
 def get_roster(team_id, season_str):
     """Pull current NBA.com roster. Returns list of {id,name,position}."""
     try:
-        ctr = commonteamroster.CommonTeamRoster(team_id=int(team_id),season=season_str)
+        ctr = commonteamroster.CommonTeamRoster(
+            team_id=int(team_id), season=season_str, timeout=_NBA_API_TIMEOUT
+        )
         df  = ctr.common_team_roster.get_data_frame()
         if df is None or df.empty: return []
         out = []
@@ -316,7 +336,8 @@ def get_player_log(player_id, n=PROP_GAMES_BACK):
             log = playergamelog.PlayerGameLog(
                 player_id=int(player_id),
                 season=season,
-                season_type_all_star='Regular Season'
+                season_type_all_star="Regular Season",
+                timeout=_NBA_API_TIMEOUT,
             ).get_data_frames()[0]
             if log is not None and not log.empty:
                 frames.append(log)
@@ -367,7 +388,9 @@ def get_player_active_status(player_id):
     if player_id in _player_status_cache:
         return _player_status_cache[player_id]
     try:
-        info = commonplayerinfo.CommonPlayerInfo(player_id=int(player_id))
+        info = commonplayerinfo.CommonPlayerInfo(
+            player_id=int(player_id), timeout=_NBA_API_TIMEOUT
+        )
         df   = info.common_player_info.get_data_frame()
         if df is not None and not df.empty:
             status = str(df.iloc[0].get('ROSTERSTATUS','')).strip()
@@ -451,6 +474,8 @@ else:
 print("=" * 62)
 print(f"  Date: {_TODAY}  |  Season: {_SEASON}")
 print(f"  Bankroll: ${BANKROLL:,.0f}  |  Kelly: {KELLY_FRACTION:.0%}  |  Max bet: {MAX_BET_PCT:.0%}")
+if os.environ.get("GITHUB_ACTIONS", "").lower() in ("true", "1", "yes"):
+    print(f"  NBA stats timeout: {_NBA_API_TIMEOUT}s (ROLI_NBA_TIMEOUT to override; cloud runners need more than 30s)")
 print()
 
 # ============================================================
@@ -464,20 +489,23 @@ _seasons = all_seasons(_TODAY)
 all_games = []
 for season in _seasons:
     print(f"  {season}...", end=" ", flush=True)
-    for attempt in range(3):
+    for attempt in range(_SEASON_FETCH_ATTEMPTS):
         try:
             gf = leaguegamefinder.LeagueGameFinder(
                 season_nullable=season,
-                season_type_nullable='Regular Season'
+                season_type_nullable="Regular Season",
+                timeout=_NBA_API_TIMEOUT,
             )
             df = gf.get_data_frames()[0]
             all_games.append(df)
-            _SEASON_LOG.append({"season":season,"rows":int(len(df))})
+            _SEASON_LOG.append({"season": season, "rows": int(len(df))})
             print(f"ok  {len(df):,}")
             break
         except Exception as e:
-            if attempt<2: time.sleep(_SLEEP_RETRY)
-            else: print(f"FAILED: {e}")
+            if attempt < _SEASON_FETCH_ATTEMPTS - 1:
+                time.sleep(_SLEEP_RETRY * (attempt + 1))
+            else:
+                print(f"FAILED: {e}")
     time.sleep(_SLEEP_SEASON)
 
 if not all_games: raise SystemExit("No season data. Check network/nba_api.")
@@ -810,7 +838,9 @@ def get_tonight():
 
     if _HAS_SCOREBOARD_V3 and scoreboardv3 is not None:
         try:
-            raw = scoreboardv3.ScoreboardV3(game_date=date_str).get_dict()
+            raw = scoreboardv3.ScoreboardV3(
+                game_date=date_str, timeout=_NBA_API_TIMEOUT
+            ).get_dict()
             board = raw.get("scoreboard") or {}
             for game in board.get("games") or []:
                 st = (game.get("gameStatusText") or "").strip().lower()
@@ -829,7 +859,7 @@ def get_tonight():
             print(f"  ! ScoreboardV3 error ({e}) — trying V2")
 
     try:
-        sb = scoreboardv2.ScoreboardV2(game_date=date_str)
+        sb = scoreboardv2.ScoreboardV2(game_date=date_str, timeout=_NBA_API_TIMEOUT)
         ginfo = sb.game_header.get_data_frame()
         if ginfo.empty:
             return []
