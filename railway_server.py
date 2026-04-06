@@ -20,9 +20,29 @@ LOG = logging.getLogger("roli.railway")
 
 REPO_ROOT = Path(__file__).resolve().parent
 PREDICTOR = REPO_ROOT / "nba_bot" / "nba_predictor.py"
-REPORT_PATH = Path(
-    os.environ.get("ROLI_RAILWAY_REPORT_PATH", "/data/roli-live-report.json")
-)
+
+
+def _resolve_report_path() -> Path:
+    """
+    Default file is /data/live-report.json with volume mount at /data only.
+    If ROLI_RAILWAY_REPORT_PATH points at a directory (common mistake: volume
+    mount path set to the same string as the intended file), write live-report.json inside it.
+    """
+    p = Path(
+        os.environ.get("ROLI_RAILWAY_REPORT_PATH", "/data/live-report.json")
+    )
+    if p.exists() and p.is_dir():
+        inner = p / "live-report.json"
+        LOG.warning(
+            "%s is a directory — volume mount should be /data, not the filename. Using %s",
+            p,
+            inner,
+        )
+        return inner
+    return p
+
+
+REPORT_PATH = _resolve_report_path()
 REFRESH_SEC = int(os.environ.get("ROLI_REFRESH_SECONDS", str(6 * 3600)))
 FIRST_DELAY_SEC = int(os.environ.get("ROLI_FIRST_RUN_DELAY_SECONDS", "0"))
 
