@@ -1580,7 +1580,23 @@ if _JSON_MODE:
         if isinstance(o,np.ndarray):  return o.tolist()
         raise TypeError(type(o))
 
-    payload = json.dumps(report,ensure_ascii=False,default=jdef)
+    def _strip_nonfinite(o):
+        """Ensure RFC-compliant JSON: Python's json allows NaN/Inf by default; JS JSON.parse does not."""
+        if isinstance(o, dict):
+            return {k: _strip_nonfinite(v) for k, v in o.items()}
+        if isinstance(o, list):
+            return [_strip_nonfinite(v) for v in o]
+        if isinstance(o, (float, np.floating)):
+            v = float(o)
+            return v if math.isfinite(v) else None
+        return o
+
+    payload = json.dumps(
+        _strip_nonfinite(report),
+        ensure_ascii=False,
+        default=jdef,
+        allow_nan=False,
+    )
     out_path = os.environ.get("ROLI_JSON_OUT")
     if out_path:
         with open(out_path,"w",encoding="utf-8") as f: f.write(payload)
