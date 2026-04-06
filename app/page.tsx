@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { GameRow, HotPropParlay, MixedParlay, RolibotReport, RiskyPropParlay, SafePropParlay } from "@/lib/types";
 import { mockReport } from "@/lib/mock-report";
 import {
@@ -33,6 +33,16 @@ function pct(n: number) {
   return `${(n * 100).toFixed(1)}%`;
 }
 
+/** Kelly $ in the report scales linearly with bankroll (same edges & caps). */
+function kellyMultiplier(reportBankroll: number, displayBankroll: number): number {
+  const base = reportBankroll > 0 ? reportBankroll : 1000;
+  return Math.max(0, displayBankroll) / base;
+}
+
+function fmtScaledUsd(amount: number, mult: number): string {
+  return `$${(amount * mult).toFixed(2)}`;
+}
+
 function ParlayLegMismatch({ declared, actual }: { declared: number; actual: number }) {
   if (declared === actual) return null;
   return (
@@ -42,7 +52,7 @@ function ParlayLegMismatch({ declared, actual }: { declared: number; actual: num
   );
 }
 
-function GamePredictionCard({ g }: { g: GameRow }) {
+function GamePredictionCard({ g, kellyMult }: { g: GameRow; kellyMult: number }) {
   const top = g.top_props ?? [];
   const risky = g.risky_props ?? [];
   const mins = g.minutes_warnings ?? [];
@@ -66,7 +76,7 @@ function GamePredictionCard({ g }: { g: GameRow }) {
       </p>
       {g.kelly_amt > 0 && (
         <p className="mt-2 font-mono text-xs text-[var(--accent)]">
-          Kelly recommended: ${g.kelly_amt.toFixed(2)}
+          Kelly recommended: {fmtScaledUsd(g.kelly_amt, kellyMult)}
         </p>
       )}
 
@@ -166,7 +176,7 @@ function probOdds(p: number): string {
   return `+${Math.round(((1 - p) / p) * 100)}`;
 }
 
-function SafeParlayCard({ p, i }: { p: SafePropParlay; i: number }) {
+function SafeParlayCard({ p, i, kellyMult }: { p: SafePropParlay; i: number; kellyMult: number }) {
   const nLegs = p.legs?.length ?? 0;
   return (
     <Card className="w-full p-5">
@@ -176,7 +186,9 @@ function SafeParlayCard({ p, i }: { p: SafePropParlay; i: number }) {
         {p.implied_american ? ` · ${p.implied_american}` : ""}
       </p>
       {p.kelly != null && p.kelly > 0 && (
-        <p className="mt-1 font-mono text-xs text-[var(--accent)]">Kelly bet size ${p.kelly.toFixed(2)}</p>
+        <p className="mt-1 font-mono text-xs text-[var(--accent)]">
+          Kelly bet size {fmtScaledUsd(p.kelly, kellyMult)}
+        </p>
       )}
       <div className="mt-3 border-t border-[var(--border)] pt-3">
         <ParlayLegMismatch declared={p.n} actual={nLegs} />
@@ -211,7 +223,7 @@ function SafeParlayCard({ p, i }: { p: SafePropParlay; i: number }) {
   );
 }
 
-function RiskyParlayCard({ p, i }: { p: RiskyPropParlay; i: number }) {
+function RiskyParlayCard({ p, i, kellyMult }: { p: RiskyPropParlay; i: number; kellyMult: number }) {
   const nLegs = p.legs?.length ?? 0;
   return (
     <Card className="w-full p-5">
@@ -221,7 +233,9 @@ function RiskyParlayCard({ p, i }: { p: RiskyPropParlay; i: number }) {
         {p.implied_american ? ` · ${p.implied_american}` : ""}
       </p>
       {p.kelly != null && p.kelly > 0 && (
-        <p className="mt-1 font-mono text-xs text-[var(--accent)]">Kelly bet size ${p.kelly.toFixed(2)}</p>
+        <p className="mt-1 font-mono text-xs text-[var(--accent)]">
+          Kelly bet size {fmtScaledUsd(p.kelly, kellyMult)}
+        </p>
       )}
       <div className="mt-3 border-t border-[var(--border)] pt-3">
         <ParlayLegMismatch declared={p.n} actual={nLegs} />
@@ -253,7 +267,9 @@ function RiskyParlayCard({ p, i }: { p: RiskyPropParlay; i: number }) {
           ))}
         </ul>
       </div>
-      <p className="mt-3 text-sm text-[var(--gold)]">Long shot — cap at $10–20 max.</p>
+      <p className="mt-3 text-sm text-[var(--gold)]">
+        Long shot — cap about {fmtScaledUsd(10, kellyMult)}–{fmtScaledUsd(20, kellyMult)} at your bankroll.
+      </p>
     </Card>
   );
 }
@@ -296,7 +312,7 @@ function HotParlayCard({ p, i }: { p: HotPropParlay; i: number }) {
   );
 }
 
-function MixedParlayCard({ m, i }: { m: MixedParlay; i: number }) {
+function MixedParlayCard({ m, i, kellyMult }: { m: MixedParlay; i: number; kellyMult: number }) {
   const side = m.team_pick.pick_side;
   const stars = m.team_pick.stars;
   return (
@@ -320,7 +336,7 @@ function MixedParlayCard({ m, i }: { m: MixedParlay; i: number }) {
       <p className="mt-3 font-mono text-xs text-[var(--muted)]">
         Combined {pct(m.combined)} · ~${m.payout} / $100
         {m.implied_american != null && m.implied_american !== "" ? ` · ${m.implied_american}` : ""}
-        {m.kelly != null && m.kelly > 0 ? ` · Kelly $${m.kelly.toFixed(2)}` : ""}
+        {m.kelly != null && m.kelly > 0 ? ` · Kelly ${fmtScaledUsd(m.kelly, kellyMult)}` : ""}
       </p>
     </Card>
   );
@@ -331,6 +347,8 @@ export default function Page() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [usedMock, setUsedMock] = useState(false);
+  const [bankrollStr, setBankrollStr] = useState("");
+  const lastReportGenRef = useRef<string | null>(null);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -371,6 +389,20 @@ export default function Page() {
   const pipe = r?.pipeline;
   const run = r?.run_meta;
   const isDev = process.env.NODE_ENV === "development";
+
+  useEffect(() => {
+    if (!r?.generated_at) return;
+    if (r.generated_at !== lastReportGenRef.current) {
+      lastReportGenRef.current = r.generated_at;
+      setBankrollStr(String(r.bankroll));
+    }
+  }, [r?.generated_at, r?.bankroll]);
+
+  const reportBankroll = r && r.bankroll > 0 ? r.bankroll : 1000;
+  const parsedBankroll = parseFloat(bankrollStr.replace(/,/g, ""));
+  const displayBankroll =
+    Number.isFinite(parsedBankroll) && parsedBankroll > 0 ? Math.min(parsedBankroll, 1e12) : reportBankroll;
+  const kellyMult = r ? kellyMultiplier(reportBankroll, displayBankroll) : 1;
 
   return (
     <div className="relative min-h-screen">
@@ -466,8 +498,28 @@ export default function Page() {
               <Card className="flex min-h-[140px] flex-col p-6">
                 <SectionTitle>Run summary</SectionTitle>
                 <p className="mt-4 font-mono text-sm leading-relaxed text-[var(--text)]">
-                  Bankroll ${r.bankroll.toLocaleString(undefined, { minimumFractionDigits: 2 })} · Kelly{" "}
+                  Model bankroll ${reportBankroll.toLocaleString(undefined, { minimumFractionDigits: 2 })} · Kelly{" "}
                   {pct(r.kelly_fraction)} · Max bet {pct(r.max_bet_pct)}
+                </p>
+                <label className="mt-4 block text-xs font-medium text-[var(--muted)]">
+                  Your bankroll ($)
+                  <input
+                    type="text"
+                    inputMode="decimal"
+                    className="mt-1.5 w-full max-w-[220px] rounded-lg border border-[var(--border)] bg-[var(--surface-bg)] px-3 py-2 font-mono text-sm text-[var(--text)] outline-none focus:border-[var(--accent)]"
+                    value={bankrollStr}
+                    onChange={(e) => setBankrollStr(e.target.value)}
+                    onBlur={() => {
+                      const p = parseFloat(bankrollStr.replace(/,/g, ""));
+                      if (!Number.isFinite(p) || p <= 0) {
+                        setBankrollStr(String(reportBankroll));
+                      }
+                    }}
+                    aria-describedby="bankroll-hint"
+                  />
+                </label>
+                <p id="bankroll-hint" className="mt-2 text-xs text-[var(--muted)]">
+                  Kelly dollar amounts below scale to this. Picks, hit rates, and edges are unchanged.
                 </p>
                 <div className="mt-3 flex flex-wrap gap-2">
                   {typeof r.llm_enabled === "boolean" &&
@@ -698,7 +750,7 @@ export default function Page() {
               ) : (
                 <div className="grid w-full grid-cols-1 gap-5 lg:grid-cols-2">
                   {r.games.map((g) => (
-                    <GamePredictionCard key={`${g.home_abbr}-${g.away_abbr}`} g={g} />
+                    <GamePredictionCard key={`${g.home_abbr}-${g.away_abbr}`} g={g} kellyMult={kellyMult} />
                   ))}
                 </div>
               )}
@@ -808,7 +860,7 @@ export default function Page() {
                   </p>
                   <div className="grid w-full grid-cols-1 gap-4 md:grid-cols-2">
                     {parlaySafeList(r).map((p, i) => (
-                      <SafeParlayCard key={i} p={p} i={i} />
+                      <SafeParlayCard key={i} p={p} i={i} kellyMult={kellyMult} />
                     ))}
                   </div>
                 </div>
@@ -820,7 +872,7 @@ export default function Page() {
                   </p>
                   <div className="grid w-full grid-cols-1 gap-4 md:grid-cols-2">
                     {parlaySgpList(r).map((p, i) => (
-                      <SafeParlayCard key={`sgp-${i}`} p={p} i={i} />
+                      <SafeParlayCard key={`sgp-${i}`} p={p} i={i} kellyMult={kellyMult} />
                     ))}
                   </div>
                 </div>
@@ -832,7 +884,7 @@ export default function Page() {
                   </p>
                   <div className="grid w-full grid-cols-1 gap-4 md:grid-cols-2">
                     {parlayRiskyList(r).map((p, i) => (
-                      <RiskyParlayCard key={i} p={p} i={i} />
+                      <RiskyParlayCard key={i} p={p} i={i} kellyMult={kellyMult} />
                     ))}
                   </div>
                 </div>
@@ -844,7 +896,7 @@ export default function Page() {
                   </p>
                   <div className="grid w-full grid-cols-1 gap-4 md:grid-cols-2">
                     {(r.parlays.mixed ?? []).map((m, i) => (
-                      <MixedParlayCard key={i} m={m} i={i} />
+                      <MixedParlayCard key={i} m={m} i={i} kellyMult={kellyMult} />
                     ))}
                   </div>
                 </div>
@@ -873,7 +925,8 @@ export default function Page() {
                     <ul className="mt-2 space-y-1 text-sm text-[var(--text)]">
                       {r.bet_slip.strong.map((g) => (
                         <li key={g.pick_abbr}>
-                          {g.pick_name} ML {pct(g.pick_prob)} ({g.pick_odds}) Kelly ${g.kelly_amt.toFixed(2)}
+                          {g.pick_name} ML {pct(g.pick_prob)} ({g.pick_odds}) Kelly{" "}
+                          {fmtScaledUsd(g.kelly_amt, kellyMult)}
                         </li>
                       ))}
                     </ul>
@@ -885,7 +938,8 @@ export default function Page() {
                     <ul className="mt-2 space-y-1 text-sm text-[var(--text)]">
                       {r.bet_slip.good.map((g) => (
                         <li key={g.pick_abbr}>
-                          {g.pick_name} ML {pct(g.pick_prob)} ({g.pick_odds}) Kelly ${g.kelly_amt.toFixed(2)}
+                          {g.pick_name} ML {pct(g.pick_prob)} ({g.pick_odds}) Kelly{" "}
+                          {fmtScaledUsd(g.kelly_amt, kellyMult)}
                         </li>
                       ))}
                     </ul>
@@ -916,7 +970,7 @@ export default function Page() {
                   </div>
                 )}
                 <p className="border-t border-[var(--border)] pt-4 font-mono text-sm text-[var(--muted)]">
-                  Total recommended (Kelly strong+good) ${r.bet_slip.total_kelly.toFixed(2)}
+                  Total recommended (Kelly strong+good) {fmtScaledUsd(r.bet_slip.total_kelly, kellyMult)}
                   {r.bet_slip.total_kelly_pct_bankroll != null && (
                     <span> ({pct(r.bet_slip.total_kelly_pct_bankroll)} of bankroll)</span>
                   )}
@@ -943,8 +997,8 @@ export default function Page() {
                   <SectionTitle>Best team parlay</SectionTitle>
                   <p className="mt-3 text-[var(--text)]">{r.parlays.best_team.legs.map((l) => l.pick_name).join(" + ")}</p>
                   <p className="mt-2 font-mono text-sm text-[var(--muted)]">
-                    {pct(r.parlays.best_team.combined)} · ${r.parlays.best_team.payout} / $100 · Kelly $
-                    {r.parlays.best_team.kelly.toFixed(2)}
+                    {pct(r.parlays.best_team.combined)} · ${r.parlays.best_team.payout} / $100 · Kelly{" "}
+                    {fmtScaledUsd(r.parlays.best_team.kelly, kellyMult)}
                   </p>
                 </Card>
               )}
@@ -960,8 +1014,11 @@ export default function Page() {
                     (firstSafeParlay(r)!.kelly != null && firstSafeParlay(r)!.kelly! > 0) ? (
                       <>
                         {" "}
-                        · Kelly $
-                        {(r.highlights?.best_prop_parlay_kelly ?? firstSafeParlay(r)!.kelly ?? 0).toFixed(2)}
+                        · Kelly{" "}
+                        {fmtScaledUsd(
+                          r.highlights?.best_prop_parlay_kelly ?? firstSafeParlay(r)!.kelly ?? 0,
+                          kellyMult,
+                        )}
                       </>
                     ) : null}
                   </p>
