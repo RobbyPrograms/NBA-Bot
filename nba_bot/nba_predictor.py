@@ -567,6 +567,27 @@ games['MOMENTUM3']  = games['PTS_ROLL3']  - games['PTS_ROLL5']
 games['FORM_SCORE'] = (games['WIN_STREAK3']*0.5 + games['WIN_STREAK5']*0.3 +
                        games['WIN_STREAK10']*0.2)
 
+# Opponent points per game (matches merged DEF_ALLOWED_HOME / DEF_ALLOWED_AWAY)
+_gh = games.loc[games['IS_HOME'] == 1, ['GAME_ID', 'TEAM_ID', 'PTS']].rename(
+    columns={'TEAM_ID': '_tid_h', 'PTS': '_pts_h'}
+)
+_ga = games.loc[games['IS_HOME'] == 0, ['GAME_ID', 'TEAM_ID', 'PTS']].rename(
+    columns={'TEAM_ID': '_tid_a', 'PTS': '_pts_a'}
+)
+_gp = _gh.merge(_ga, on='GAME_ID', how='inner')
+_da_parts = [
+    _gp.rename(columns={'_tid_h': 'TEAM_ID', '_pts_a': 'DEF_ALLOWED'})[
+        ['GAME_ID', 'TEAM_ID', 'DEF_ALLOWED']
+    ],
+    _gp.rename(columns={'_tid_a': 'TEAM_ID', '_pts_h': 'DEF_ALLOWED'})[
+        ['GAME_ID', 'TEAM_ID', 'DEF_ALLOWED']
+    ],
+]
+games = games.merge(pd.concat(_da_parts, ignore_index=True), on=['GAME_ID', 'TEAM_ID'], how='left')
+games['DEF_ALLOWED_ROLL10'] = games.groupby('TEAM_ID')['DEF_ALLOWED'].transform(
+    lambda x: x.shift(1).rolling(10, min_periods=5).mean()
+)
+
 # Merge home/away
 home   = games[games['IS_HOME']==1].copy()
 away   = games[games['IS_HOME']==0].copy()
@@ -635,6 +656,7 @@ X = merged[FEATURE_COLS]; y = merged['HOME_WIN']
 split    = int(len(X)*0.80)
 X_train  = X.iloc[:split]; y_train = y.iloc[:split]
 X_test   = X.iloc[split:]; y_test  = y.iloc[split:]
+FEATURE_FILL_MEDIAN = X_train.median()
 print(f"  Train: {len(X_train):,}  |  Test: {len(X_test):,}\n")
 
 # ============================================================
@@ -1121,6 +1143,7 @@ def predict_game(home_abbr, away_abbr):
         if dk in FEATURE_COLS:
             row[dk] = hf.get(stat,0) - af.get(stat,0)
     Xp = pd.DataFrame([{c:row.get(c,np.nan) for c in FEATURE_COLS}])[FEATURE_COLS]
+    Xp = Xp.apply(pd.to_numeric, errors='coerce').fillna(FEATURE_FILL_MEDIAN)
     return float(calibrated.predict_proba(Xp)[0][1])
 
 game_results = []
