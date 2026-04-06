@@ -658,55 +658,6 @@ export default function Page() {
               </section>
             )}
 
-            {r.daily_update_instructions != null && (
-              <section className="w-full space-y-4">
-                <SectionHeading>CLI &amp; scheduling</SectionHeading>
-                <Card className="w-full space-y-3 p-5">
-                  <p className="text-sm text-[var(--muted)]">
-                    From the predictor run — local Task Scheduler / cron replaces CI if you prefer.
-                  </p>
-                  <ul className="space-y-2 font-mono text-xs leading-relaxed text-[var(--text)]">
-                    {r.daily_update_instructions.windows != null && r.daily_update_instructions.windows !== "" && (
-                      <li>
-                        <span className="text-[var(--muted)]">Windows: </span>
-                        {r.daily_update_instructions.windows}
-                      </li>
-                    )}
-                    {r.daily_update_instructions.mac_linux != null && r.daily_update_instructions.mac_linux !== "" && (
-                      <li>
-                        <span className="text-[var(--muted)]">Mac/Linux: </span>
-                        {r.daily_update_instructions.mac_linux}
-                      </li>
-                    )}
-                    {r.daily_update_instructions.json_mode != null && r.daily_update_instructions.json_mode !== "" && (
-                      <li>
-                        <span className="text-[var(--muted)]">JSON: </span>
-                        {r.daily_update_instructions.json_mode}
-                      </li>
-                    )}
-                    {r.daily_update_instructions.backtest != null && r.daily_update_instructions.backtest !== "" && (
-                      <li>
-                        <span className="text-[var(--muted)]">Backtest: </span>
-                        {r.daily_update_instructions.backtest}
-                      </li>
-                    )}
-                    {r.daily_update_instructions.llm != null && r.daily_update_instructions.llm !== "" && (
-                      <li>
-                        <span className="text-[var(--muted)]">LLM: </span>
-                        {r.daily_update_instructions.llm}
-                      </li>
-                    )}
-                    {r.daily_update_instructions.retrain != null && r.daily_update_instructions.retrain !== "" && (
-                      <li>
-                        <span className="text-[var(--muted)]">Retrain: </span>
-                        {r.daily_update_instructions.retrain}
-                      </li>
-                    )}
-                  </ul>
-                </Card>
-              </section>
-            )}
-
             {pipe?.props_fetch && pipe.props_fetch.length > 0 && (
               <section className="w-full space-y-4">
                 <SectionHeading>Viable props by team</SectionHeading>

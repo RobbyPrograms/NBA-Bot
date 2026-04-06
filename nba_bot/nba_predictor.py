@@ -20,7 +20,7 @@
 #
 # ============================================================
 
-import os, sys, time, warnings, itertools, pickle, hashlib, json, urllib.request, difflib, math
+import os, re, sys, time, warnings, itertools, pickle, hashlib, json, urllib.request, difflib, math, unicodedata
 warnings.filterwarnings('ignore')
 
 # ─────────────────────────────────────────────────────────────
@@ -113,7 +113,7 @@ _SEASON_FETCH_ATTEMPTS = (
 # Includes GTD and questionable — better to miss a prop than bet on a limited player
 INJURY_EXCLUDE = {
     "out","doubtful","suspended","inactive",
-    "questionable","day-to-day","game time decision",
+    "questionable","day-to-day","day to day","game time decision",
     "gtd","did not play","dnp","il","injured list",
 }
 
@@ -211,9 +211,14 @@ def prop_conf(hr):
     return "RISKY","~"
 
 def normalize_name(n):
-    n=(n or "").lower().strip()
-    for sfx in (" jr."," sr."," ii"," iii"," iv"," v"):
-        if n.endswith(sfx): n=n[:-len(sfx)].strip()
+    """Lowercase + strip accents so ESPN vs NBA.com name spellings match (e.g. Dončić / Doncic)."""
+    n = (n or "").strip()
+    n = unicodedata.normalize("NFD", n)
+    n = "".join(c for c in n if unicodedata.category(c) != "Mn")
+    n = n.lower().strip()
+    for sfx in (" jr.", " sr.", " ii", " iii", " iv", " v"):
+        if n.endswith(sfx):
+            n = n[: -len(sfx)].strip()
     return " ".join(n.split())
 
 def names_match(a, b_set):
@@ -268,33 +273,66 @@ def fetch_injuries():
         _INJURY_META = {"fetched_ok":False,"error":str(e)[:200]}
     return out
 
+
+def _injury_status_excludes(st: str) -> bool:
+    """True if ESPN status means do not offer props."""
+    if not st:
+        return False
+    s = " ".join(st.lower().replace("-", " ").split())
+    if s in INJURY_EXCLUDE:
+        return True
+    tokens = set(re.findall(r"[a-z0-9]+", s))
+    for excl in INJURY_EXCLUDE:
+        if " " in excl:
+            if excl in s:
+                return True
+        elif excl in tokens:
+            return True
+    return False
+
+
+def _find_injury_record(name, injuries):
+    """Match roster/API player name to ESPN injury row (accent-fold + fuzzy + unique last+initial)."""
+    if not name or not injuries:
+        return None
+    nk = normalize_name(name)
+    if nk in injuries:
+        return injuries[nk]
+    best_v = None
+    best_r = 0.0
+    for o, v in injuries.items():
+        r = difflib.SequenceMatcher(None, nk, o).ratio()
+        if r > best_r:
+            best_r, best_v = r, v
+    if best_r >= 0.88:
+        return best_v
+    parts = nk.split()
+    if len(parts) >= 2:
+        last, fi = parts[-1], parts[0][:1]
+        matches = [
+            v
+            for o, v in injuries.items()
+            if len(o.split()) >= 2 and o.split()[-1] == last and o.split()[0][:1] == fi
+        ]
+        if len(matches) == 1:
+            return matches[0]
+    return None
+
+
 def player_is_out(name, injuries):
     """True if player is unavailable per injury report."""
-    if not name or not injuries: return False
-    nk = normalize_name(name)
-    # Exact match first
-    if nk in injuries:
-        st = injuries[nk].get("status","").lower().replace("-"," ")
-        if st in INJURY_EXCLUDE: return True
-        for excl in INJURY_EXCLUDE:
-            if excl in st: return True
-    # Fuzzy match for name variants
-    for o,v in injuries.items():
-        if difflib.SequenceMatcher(None,nk,o).ratio() >= 0.88:
-            st = v.get("status","").lower().replace("-"," ")
-            if st in INJURY_EXCLUDE: return True
-    return False
+    rec = _find_injury_record(name, injuries)
+    if rec is None:
+        return False
+    return _injury_status_excludes(rec.get("status", ""))
+
 
 def player_injury_status(name, injuries):
     """Returns status string or empty string."""
-    if not name or not injuries: return ""
-    nk = normalize_name(name)
-    if nk in injuries:
-        return injuries[nk].get("status","")
-    for o,v in injuries.items():
-        if difflib.SequenceMatcher(None,nk,o).ratio() >= 0.88:
-            return v.get("status","")
-    return ""
+    rec = _find_injury_record(name, injuries)
+    if rec is None:
+        return ""
+    return rec.get("status", "")
 
 # ─────────────────────────────────────────────────────────────
 #  LIVE ROSTER  (NBA.com CommonTeamRoster, no hardcoding)
@@ -844,9 +882,9 @@ for tid in games['TEAM_ID'].unique():
 # Pull injuries FIRST — critical filter
 print("  Fetching live injury report (ESPN)...")
 injuries = fetch_injuries()
-n_out = sum(1 for v in injuries.values()
-            if v.get('status','').lower().replace('-',' ') in INJURY_EXCLUDE
-            or any(e in v.get('status','').lower() for e in INJURY_EXCLUDE))
+n_out = sum(
+    1 for v in injuries.values() if _injury_status_excludes(v.get("status", ""))
+)
 print(f"  {len(injuries)} players tracked  |  {n_out} excluded (Out/Doubtful/GTD/Questionable)\n")
 
 def get_tonight():
