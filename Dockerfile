@@ -3,6 +3,9 @@ FROM python:3.12-slim-bookworm
 
 WORKDIR /app
 
+# Default report path (override with ROLI_RAILWAY_REPORT_PATH). Mount a Railway volume on /data to survive redeploys.
+RUN mkdir -p /data
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     libgomp1 \
@@ -17,6 +20,7 @@ COPY railway_server.py ./
 ENV PYTHONUNBUFFERED=1
 # Longer NBA API reads from cloud IPs (override in Railway if needed)
 ENV ROLI_NBA_TIMEOUT=240
+ENV ROLI_RAILWAY_REPORT_PATH=/data/roli-live-report.json
 
 # Railway sets PORT at runtime; shell expands it here
 CMD ["/bin/sh", "-c", "exec gunicorn --bind 0.0.0.0:${PORT:-8080} --workers 1 --threads 4 --timeout 120 railway_server:app"]

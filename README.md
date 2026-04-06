@@ -48,16 +48,17 @@ This repo includes a **Dockerfile** and `railway_server.py`: a small web process
 
 1. Create a project on [Railway](https://railway.app/) and **Deploy from GitHub** (this repo).
 2. Railway should detect **`railway.toml`** and build with the Dockerfile. No start command override needed.
-3. After deploy, open the service **URL** (e.g. `https://your-service.up.railway.app`) and wait for the first run (several minutes). **`/live-report.json`** returns **503** until the first successful run finishes.
-4. In Vercel, set **`ROLI_REPORT_URL`** to `https://<your-railway-host>/live-report.json`.
+3. **Strongly recommended:** add a [Railway volume](https://docs.railway.app/guides/volumes) on this service with mount path **`/data`**. Without it, **redeploys and restarts wipe the report file**; **`/live-report.json`** then stays **503** until the predictor finishes again (often **30–60+ minutes**), which looks “broken” on Vercel.
+4. After deploy, open the service root URL (e.g. `https://your-service.up.railway.app/`). Check **`predictor_running`** and **`last_run`** in the JSON. **`/live-report.json`** returns **503** until the first successful run writes **`/data/roli-live-report.json`**.
+5. In Vercel, set **`ROLI_REPORT_URL`** to `https://<your-railway-host>/live-report.json` and redeploy the frontend.
 
 **Useful variables** (Railway → service → **Variables**):
 
 | Variable | Purpose |
 |----------|---------|
 | `ROLI_REFRESH_SECONDS` | Seconds between automatic runs (default **21600** = 6 hours; minimum sleep between runs is **120** seconds). |
-| `ROLI_FIRST_RUN_DELAY_SECONDS` | Delay before the first run after boot (default **8**). |
-| `ROLI_RAILWAY_REPORT_PATH` | Where the JSON file is written (default **`/tmp/roli-live-report.json`**). Use a [Railway volume](https://docs.railway.app/guides/volumes) mount path if you want the file to survive restarts (optional). |
+| `ROLI_FIRST_RUN_DELAY_SECONDS` | Delay before the first background run after boot (default **0**). |
+| `ROLI_RAILWAY_REPORT_PATH` | Where the JSON file is written (default **`/data/roli-live-report.json`**). Mount a volume at **`/data`** so the file survives redeploys. |
 | `ROLI_NBA_TIMEOUT` | NBA API read timeout in seconds (default **240** in the image). |
 | `HTTPS_PROXY` / `HTTP_PROXY` | Same idea as GitHub Actions: if `stats.nba.com` blocks Railway’s IP, point traffic through a proxy that exits on a non-blocked network. |
 | `ROLI_REFRESH_SECRET` | If set, you can **`POST /refresh`** with header **`X-Roli-Refresh-Secret: <same value>`** to kick a background refresh (returns **202**). |

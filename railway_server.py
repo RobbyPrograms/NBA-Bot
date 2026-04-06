@@ -21,14 +21,15 @@ LOG = logging.getLogger("roli.railway")
 REPO_ROOT = Path(__file__).resolve().parent
 PREDICTOR = REPO_ROOT / "nba_bot" / "nba_predictor.py"
 REPORT_PATH = Path(
-    os.environ.get("ROLI_RAILWAY_REPORT_PATH", "/tmp/roli-live-report.json")
+    os.environ.get("ROLI_RAILWAY_REPORT_PATH", "/data/roli-live-report.json")
 )
 REFRESH_SEC = int(os.environ.get("ROLI_REFRESH_SECONDS", str(6 * 3600)))
-FIRST_DELAY_SEC = int(os.environ.get("ROLI_FIRST_RUN_DELAY_SECONDS", "8"))
+FIRST_DELAY_SEC = int(os.environ.get("ROLI_FIRST_RUN_DELAY_SECONDS", "0"))
 
 app = Flask(__name__)
 _run_lock = threading.Lock()
 _last: dict = {"ok": False, "error": None, "finished_at": None}
+_predictor_running = False
 
 
 def _run_predictor() -> subprocess.CompletedProcess[str]:
@@ -36,6 +37,10 @@ def _run_predictor() -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
     env["ROLI_JSON"] = "1"
     env["ROLI_JSON_OUT"] = str(REPORT_PATH)
+    LOG.info(
+        "Starting predictor subprocess (often 30–60+ min first time) → %s",
+        REPORT_PATH,
+    )
     return subprocess.run(
         [sys.executable, str(PREDICTOR)],
         cwd=str(REPO_ROOT),
@@ -59,9 +64,11 @@ def _record(cp: subprocess.CompletedProcess[str]) -> None:
 
 
 def _refresh_loop() -> None:
+    global _predictor_running
     time.sleep(max(0, FIRST_DELAY_SEC))
     while True:
         with _run_lock:
+            _predictor_running = True
             try:
                 _record(_run_predictor())
             except Exception as e:
@@ -69,6 +76,8 @@ def _refresh_loop() -> None:
                 _last["error"] = str(e)
                 _last["finished_at"] = time.time()
                 LOG.exception("Predictor exception")
+            finally:
+                _predictor_running = False
         time.sleep(max(120, REFRESH_SEC))
 
 
@@ -99,6 +108,7 @@ def health():
         service="rolibot-railway",
         report=str(REPORT_PATH),
         report_ready=REPORT_PATH.is_file(),
+        predictor_running=_predictor_running,
         last_run=_last,
     )
 
@@ -135,13 +145,18 @@ def manual_refresh():
         return jsonify(ok=False, error="Unauthorized"), 401
 
     def _job():
+        global _predictor_running
         with _run_lock:
+            _predictor_running = True
             try:
-                _record(_run_predictor())
-            except Exception as e:
-                _last["ok"] = False
-                _last["error"] = str(e)
-                _last["finished_at"] = time.time()
+                try:
+                    _record(_run_predictor())
+                except Exception as e:
+                    _last["ok"] = False
+                    _last["error"] = str(e)
+                    _last["finished_at"] = time.time()
+            finally:
+                _predictor_running = False
 
     threading.Thread(target=_job, daemon=True).start()
     return jsonify(ok=True, message="Refresh started in background"), 202
