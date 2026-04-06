@@ -2,6 +2,10 @@
 # so Vercel can set ROLI_REPORT_URL to:
 #   https://raw.githubusercontent.com/<owner>/<repo>/report-data/live-report.json
 #
+# stats.nba.com often blocks or throttles GitHub-hosted runner IPs (Azure). If jobs
+# always time out, use a self-hosted runner, run locally and push JSON (see README),
+# or add repo secret ROLI_HTTPS_PROXY (residential / non-cloud proxy) — wired below.
+#
 # Requires: public repo (raw URLs are anonymous) OR use another host + URL.
 name: Publish live report
 
@@ -20,8 +24,10 @@ concurrency:
 
 jobs:
   publish:
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # Use self-hosted so stats.nba.com sees your home IP (GitHub-hosted Azure IPs are often blocked).
+    # Install a runner: Repo Settings → Actions → Runners → New self-hosted runner. See README.
+    runs-on: self-hosted
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
 
@@ -43,12 +49,20 @@ jobs:
         env:
           ROLI_JSON: "1"
           ROLI_JSON_OUT: ${{ github.workspace }}/roli-live-report.json
-          # stats.nba.com is slow / flaky from GitHub IPs; override with ROLI_NBA_TIMEOUT if needed
           ROLI_NBA_TIMEOUT: "240"
-        # -u: unbuffered logs (GITHUB_ACTIONS is set by GitHub so predictor keeps stdout for progress)
-        run: python -u nba_bot/nba_predictor.py
+        shell: bash
+        run: |
+          set -e
+          P="${{ secrets.ROLI_HTTPS_PROXY }}"
+          if [ -n "$P" ]; then
+            export HTTPS_PROXY="$P"
+            export HTTP_PROXY="$P"
+            echo "Using HTTPS_PROXY for stats.nba.com (nba_api/requests)."
+          fi
+          python -u nba_bot/nba_predictor.py
 
       - name: Push live-report.json to report-data branch
+        shell: bash
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |

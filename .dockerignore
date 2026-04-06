@@ -1,0 +1,11 @@
+.git
+.github
+.next
+node_modules
+*.pyc
+__pycache__
+.env
+.env.*
+*.md
+roli-live-report.json
+report-data
