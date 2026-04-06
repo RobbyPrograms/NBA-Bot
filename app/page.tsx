@@ -370,6 +370,7 @@ export default function Page() {
   const r = data;
   const pipe = r?.pipeline;
   const run = r?.run_meta;
+  const isDev = process.env.NODE_ENV === "development";
 
   return (
     <div className="relative min-h-screen">
@@ -411,12 +412,18 @@ export default function Page() {
           <Card className="w-full border-amber-500/40 bg-[var(--card-inner)] p-6">
             <p className="font-semibold text-[var(--text)]">Could not load live report</p>
             <p className="mt-2 text-sm text-[var(--muted)]">{error}</p>
-            <p className="mt-4 text-sm text-[var(--muted)]">
-              Point <code className="font-mono text-[var(--accent)]">ROLI_REPORT_URL</code> or{" "}
-              <code className="font-mono text-[var(--accent)]">ROLI_BACKEND_URL</code> at JSON from{" "}
-              <code className="font-mono text-[var(--text)]">nba_predictor.py</code>, or open with{" "}
-              <code className="font-mono text-[var(--text)]">?demo=1</code> for a static UI sample only.
-            </p>
+            {!isDev ? (
+              <p className="mt-4 text-sm text-[var(--muted)]">
+                Try again in a few minutes. If this keeps happening, the report service may be updating or temporarily
+                unavailable.
+              </p>
+            ) : (
+              <p className="mt-4 text-sm text-[var(--muted)]">
+                Point <code className="font-mono text-[var(--accent)]">ROLI_REPORT_URL</code> or{" "}
+                <code className="font-mono text-[var(--accent)]">ROLI_BACKEND_URL</code> at predictor JSON, or open with{" "}
+                <code className="font-mono text-[var(--text)]">?demo=1</code> for a static sample.
+              </p>
+            )}
           </Card>
         )}
 
@@ -431,7 +438,7 @@ export default function Page() {
               </Card>
             )}
 
-            {!usedMock && r.brand.includes("local demo") && (
+            {isDev && !usedMock && r.brand.includes("local demo") && (
               <Card className="w-full border-[var(--border)] bg-[var(--card-inner)] p-4">
                 {r.is_placeholder ? (
                   <p className="text-sm leading-relaxed text-[var(--muted)]">
@@ -470,7 +477,9 @@ export default function Page() {
                       </span>
                     ) : (
                       <span className="rounded-full border border-[var(--border)] px-2.5 py-0.5 text-[11px] text-[var(--muted)]">
-                        LLM off — set ANTHROPIC_API_KEY for Claude narratives
+                        {isDev
+                          ? "LLM off — set ANTHROPIC_API_KEY for narratives"
+                          : "Narrative layer off"}
                       </span>
                     ))}
                   {slateDateDisplay(r) != null && (
@@ -520,8 +529,8 @@ export default function Page() {
                 <StatTile label="Edge vs breakeven" value={`+${modelEdgePp(r).toFixed(1)} pp`} />
               </div>
               <p className="text-sm text-[var(--muted)]">
-                Classification breakdown, calibration bins, validation curves, and train/cache behavior (when present in
-                JSON) are described on{" "}
+                Classification breakdown, calibration, validation curves, and training details (when included in the
+                report) are described on{" "}
                 <Link href="/how-it-works" className="font-medium text-[var(--accent)] underline-offset-2 hover:underline">
                   How it works
                 </Link>
@@ -558,9 +567,8 @@ export default function Page() {
                       ))}
                     </ul>
                     <p className="mt-3 text-xs text-[var(--muted)]">
-                      If this list doesn&apos;t match what your book shows for &quot;tonight,&quot; the report may be
-                      stale (regenerate JSON), the slate date may differ from your timezone, or finished games may have
-                      been omitted (see predictor env <code className="font-mono">ROLI_SCOREBOARD_SKIP_FINAL</code>).
+                      If this list doesn&apos;t match your sportsbook, the slate date, timezone, or which games have
+                      finished may differ from this run.
                     </p>
                   </Card>
                 )}
@@ -615,9 +623,6 @@ export default function Page() {
             {injurySummary(r) != null && (
               <section className="w-full space-y-4">
                 <SectionHeading>Injury feed snapshot</SectionHeading>
-                <p className="text-sm text-[var(--muted)]">
-                  Live JSON may attach this at the root or under <code className="font-mono text-xs">pipeline</code>.
-                </p>
                 <div className="grid w-full grid-cols-2 gap-3 lg:grid-cols-4">
                   {injurySummary(r)!.n_tracked != null && (
                     <StatTile label="Players tracked" value={String(injurySummary(r)!.n_tracked)} />
@@ -661,10 +666,6 @@ export default function Page() {
             {pipe?.props_fetch && pipe.props_fetch.length > 0 && (
               <section className="w-full space-y-4">
                 <SectionHeading>Viable props by team</SectionHeading>
-                <p className="text-sm text-[var(--muted)]">
-                  Player logs scanned for {pipe.props_teams_fetched ?? "—"} teams (Out list filtered when injury feed
-                  loads).
-                </p>
                 <Card className="w-full overflow-hidden p-0">
                   <table className="w-full text-left text-sm">
                     <thead>
@@ -706,10 +707,9 @@ export default function Page() {
             <section className="w-full space-y-4">
               <div className="space-y-1">
                 <SectionHeading>Props by matchup</SectionHeading>
-                <p className="text-sm text-[var(--muted)]">Dense table view — same lines as the game cards above.</p>
               </div>
               {r.games.every((g) => (g.top_props?.length ?? 0) === 0 && (g.risky_props?.length ?? 0) === 0) ? (
-                <p className="text-sm text-[var(--muted)]">No prop rows in this run.</p>
+                <p className="text-sm text-[var(--muted)]">No props on the slate for this run.</p>
               ) : (
                 <div className="grid w-full grid-cols-1 gap-5">
                   {r.games.map((g) => {
@@ -818,7 +818,6 @@ export default function Page() {
                   <p className="text-[11px] font-semibold uppercase tracking-[0.2em] text-[var(--accent-2)]">
                     Same-game parlays (SGP)
                   </p>
-                  <p className="text-xs text-[var(--muted)]">All legs from one matchup; still assumes leg independence in the math.</p>
                   <div className="grid w-full grid-cols-1 gap-4 md:grid-cols-2">
                     {parlaySgpList(r).map((p, i) => (
                       <SafeParlayCard key={`sgp-${i}`} p={p} i={i} />
