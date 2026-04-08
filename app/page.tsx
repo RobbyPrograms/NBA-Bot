@@ -5,6 +5,12 @@ import { useCallback, useEffect, useState } from "react";
 import type { GameRow, HotPropParlay, MixedParlay, RolibotReport, RiskyPropParlay, SafePropParlay } from "@/lib/types";
 import { mockReport } from "@/lib/mock-report";
 import {
+  buildPropInsightHeadline,
+  formatOpponentWeightLine,
+  opponentWeightTitle,
+  cleanInsightToken,
+} from "@/lib/prop-insights-display";
+import {
   collectReportTeamAbbrs,
   firstRiskyParlay,
   firstSafeParlay,
@@ -66,7 +72,7 @@ function GamePredictionCard({ g }: { g: GameRow }) {
         <span className="text-[var(--muted)]">({g.pick_side})</span>
       </div>
       <p className="mt-1 text-sm text-[var(--muted)]">
-        Signal: {g.confidence} {g.stars}
+        Signal: {buildPropInsightHeadline([g.stars, g.confidence]) || "—"}
       </p>
       {g.analysis != null && g.analysis.trim() !== "" && (
         <div className="mt-4 rounded-xl border border-[var(--border)] bg-[var(--card-inner)] p-3">
@@ -84,7 +90,14 @@ function GamePredictionCard({ g }: { g: GameRow }) {
             Top props (high confidence)
           </p>
           <ul className="mt-2 space-y-3 text-[15px] leading-snug">
-            {top.map((p) => (
+            {top.map((p) => {
+              const insightHeadline = buildPropInsightHeadline([
+                p.stars,
+                p.confidence_tier ?? p.confidence,
+                p.trend,
+                p.trend3,
+              ]);
+              return (
               <li
                 key={`${p.player}-${p.label}`}
                 className="flex flex-col gap-1 border-b border-[var(--border)] pb-3 last:border-0"
@@ -97,15 +110,15 @@ function GamePredictionCard({ g }: { g: GameRow }) {
                   <span className="shrink-0 font-mono text-sm text-[var(--accent)]">{pct(p.hit_rate)}</span>
                 </div>
                 <div className="text-[13px] text-[var(--muted)]">
-                  {p.stars ? <span>{p.stars} </span> : null}
-                  {(p.confidence_tier ?? p.confidence) ? (
-                    <span>{p.confidence_tier ?? p.confidence} </span>
-                  ) : null}
-                  {p.trend ? <span>{p.trend} </span> : null}
-                  {p.trend3 ? <span>{p.trend3} </span> : null}
-                  {p.opp ? <span className="font-mono">vs {p.opp} </span> : null}
+                  {insightHeadline ? <span>{insightHeadline}</span> : null}
+                  {p.opp ? <span className="ml-1 font-mono">vs {p.opp}</span> : null}
                   {Math.abs(p.opp_factor - 1) > 0.02 ? (
-                    <span className="font-mono">[opp adj ×{p.opp_factor.toFixed(2)}]</span>
+                    <span
+                      className="mt-1 block text-[11px] leading-snug text-[var(--muted)]"
+                      title={opponentWeightTitle(p.opp_factor)}
+                    >
+                      {formatOpponentWeightLine(p.opp_factor)}
+                    </span>
                   ) : null}
                   {p.inj_status ? <span className="block text-[11px]">Inj: {p.inj_status}</span> : null}
                   {p.avg_recent3 != null ? (
@@ -120,7 +133,8 @@ function GamePredictionCard({ g }: { g: GameRow }) {
                   threshold={p.threshold}
                 />
               </li>
-            ))}
+            );
+            })}
           </ul>
         </div>
       )}
@@ -131,14 +145,16 @@ function GamePredictionCard({ g }: { g: GameRow }) {
             Risky picks (high payout potential)
           </p>
           <ul className="mt-2 space-y-2.5 text-[15px] leading-snug">
-            {risky.map((p) => (
+            {risky.map((p) => {
+              const riskyTrend = cleanInsightToken(p.trend);
+              return (
               <li
                 key={`r-${p.player}-${p.label}`}
                 className="flex flex-wrap justify-between gap-2 border-b border-[var(--border)] pb-2 last:border-0"
               >
                 <span className="text-[var(--text)]">
                   {p.player} <span className="text-[var(--muted)]">{p.label}</span>
-                  {p.trend ? <span className="ml-1 text-[var(--muted)]">{p.trend}</span> : null}
+                  {riskyTrend ? <span className="ml-1 text-[var(--muted)]">{riskyTrend}</span> : null}
                 </span>
                 <span className="shrink-0 font-mono text-sm text-[var(--muted)]">
                   {pct(p.hit_rate)} · avg {p.avg.toFixed(1)}
@@ -151,7 +167,8 @@ function GamePredictionCard({ g }: { g: GameRow }) {
                   threshold={p.threshold}
                 />
               </li>
-            ))}
+            );
+            })}
           </ul>
         </div>
       )}
@@ -190,7 +207,9 @@ function SafeParlayCard({ p, i }: { p: SafePropParlay; i: number }) {
       <div className="mt-3 border-t border-[var(--border)] pt-3">
         <ParlayLegMismatch declared={p.n} actual={nLegs} />
         <ul className="space-y-3">
-          {(p.legs ?? []).map((leg, j) => (
+          {(p.legs ?? []).map((leg, j) => {
+            const legInsight = buildPropInsightHeadline([leg.stars, leg.confidence, leg.trend]);
+            return (
             <li
               key={j}
               className="border-l-2 border-[var(--accent)]/50 pl-3 text-[15px] leading-snug text-[var(--text)]"
@@ -208,9 +227,7 @@ function SafeParlayCard({ p, i }: { p: SafePropParlay; i: number }) {
               />
               <div className="mt-1 font-mono text-sm text-[var(--accent)]">{pct(leg.hit_rate)}</div>
               <div className="mt-0.5 text-[13px] text-[var(--muted)]">
-                {leg.stars ? <span>{leg.stars} </span> : null}
-                {leg.confidence ? <span>{leg.confidence} </span> : null}
-                {leg.trend ? <span>{leg.trend}</span> : null}
+                {legInsight ? <span>{legInsight}</span> : null}
                 {leg.team != null && leg.team !== "" ? (
                   <span className="ml-1 font-mono text-[11px]">{leg.team}</span>
                 ) : null}
@@ -219,7 +236,8 @@ function SafeParlayCard({ p, i }: { p: SafePropParlay; i: number }) {
                 ) : null}
               </div>
             </li>
-          ))}
+            );
+          })}
         </ul>
       </div>
     </Card>
@@ -238,7 +256,9 @@ function RiskyParlayCard({ p, i }: { p: RiskyPropParlay; i: number }) {
       <div className="mt-3 border-t border-[var(--border)] pt-3">
         <ParlayLegMismatch declared={p.n} actual={nLegs} />
         <ul className="space-y-3">
-          {(p.legs ?? []).map((leg, j) => (
+          {(p.legs ?? []).map((leg, j) => {
+            const riskyLegTrend = cleanInsightToken(leg.trend);
+            return (
             <li
               key={j}
               className="border-l-2 border-[var(--gold)]/60 pl-3 text-[15px] leading-snug text-[var(--text)]"
@@ -260,7 +280,9 @@ function RiskyParlayCard({ p, i }: { p: RiskyPropParlay; i: number }) {
                   avg {typeof leg.avg === "number" ? leg.avg.toFixed(1) : "—"}
                 </span>
               </div>
-              {leg.trend ? <div className="mt-0.5 text-[13px] text-[var(--muted)]">{leg.trend}</div> : null}
+              {riskyLegTrend ? (
+                <div className="mt-0.5 text-[13px] text-[var(--muted)]">{riskyLegTrend}</div>
+              ) : null}
               {leg.team != null && leg.team !== "" ? (
                 <div className="mt-0.5 font-mono text-[11px] text-[var(--muted)]">
                   {leg.team}
@@ -268,7 +290,8 @@ function RiskyParlayCard({ p, i }: { p: RiskyPropParlay; i: number }) {
                 </div>
               ) : null}
             </li>
-          ))}
+            );
+          })}
         </ul>
       </div>
       <p className="mt-3 text-sm text-[var(--gold)]">Long shot — cap at $10–20 max.</p>
@@ -288,7 +311,9 @@ function HotParlayCard({ p, i }: { p: HotPropParlay; i: number }) {
       <div className="mt-3 border-t border-[var(--border)] pt-3">
         <ParlayLegMismatch declared={p.n} actual={nLegs} />
         <ul className="space-y-3">
-          {(p.legs ?? []).map((leg, j) => (
+          {(p.legs ?? []).map((leg, j) => {
+            const hotTrend = cleanInsightToken(leg.trend);
+            return (
             <li
               key={j}
               className="border-l-2 border-[var(--accent-2)]/60 pl-3 text-[15px] leading-snug text-[var(--text)]"
@@ -306,14 +331,15 @@ function HotParlayCard({ p, i }: { p: HotPropParlay; i: number }) {
               />
               <div className="mt-1 font-mono text-sm text-[var(--accent)]">{pct(leg.hit_rate)}</div>
               <div className="mt-1 text-[13px] text-[var(--muted)]">
-                {leg.trend ? <span>{leg.trend} </span> : null}
+                {hotTrend ? <span>{hotTrend} </span> : null}
                 <span className="font-mono">
                   recent {typeof leg.avg_recent === "number" ? leg.avg_recent.toFixed(1) : "—"} vs season{" "}
                   {typeof leg.avg === "number" ? leg.avg.toFixed(1) : "—"}
                 </span>
               </div>
             </li>
-          ))}
+            );
+          })}
         </ul>
       </div>
     </Card>
@@ -322,18 +348,20 @@ function HotParlayCard({ p, i }: { p: HotPropParlay; i: number }) {
 
 function MixedParlayCard({ m, i }: { m: MixedParlay; i: number }) {
   const side = m.team_pick.pick_side;
-  const stars = m.team_pick.stars;
+  const pickStars = cleanInsightToken(m.team_pick.stars);
+  const prop1Trend = cleanInsightToken(m.prop.trend);
+  const prop2Trend = m.prop2 ? cleanInsightToken(m.prop2.trend) : undefined;
   return (
     <Card className="w-full p-5">
       <p className="font-mono text-[11px] text-[var(--muted)]">Mixed #{i + 1}</p>
       <p className="mt-2 text-sm text-[var(--text)]">
         {m.team_pick.pick_name}
         {side != null && side !== "" ? ` (${side})` : ""} {pct(m.team_pick.pick_prob)}
-        {stars != null && stars !== "" ? ` ${stars}` : ""}
+        {pickStars ? ` · ${pickStars}` : ""}
       </p>
       <p className="mt-1 text-sm text-[var(--muted)]">
         ▸ {m.prop.player} — {m.prop.label} {pct(m.prop.hit_rate)}
-        {m.prop.trend ? ` ${m.prop.trend}` : ""}
+        {prop1Trend ? ` · ${prop1Trend}` : ""}
       </p>
       <AiPropLiveBar
         player={m.prop.player}
@@ -346,7 +374,7 @@ function MixedParlayCard({ m, i }: { m: MixedParlay; i: number }) {
       {m.prop2 && (
         <p className="mt-1 text-sm text-[var(--muted)]">
           ▸ {m.prop2.player} — {m.prop2.label} {pct(m.prop2.hit_rate)}
-          {m.prop2.trend ? ` ${m.prop2.trend}` : ""}
+          {prop2Trend ? ` · ${prop2Trend}` : ""}
         </p>
       )}
       {m.prop2 ? (
@@ -801,10 +829,21 @@ export default function Page() {
                                       />
                                     </td>
                                     <td className="py-2.5 pr-3 font-mono text-sm text-[var(--accent)]">{pct(p.hit_rate)}</td>
-                                    <td className="py-2.5 text-[13px] text-[var(--muted)]">
-                                      {[p.stars, p.trend, p.confidence_tier ?? p.confidence].filter(Boolean).join(" · ")}
+                                    <td className="py-2.5 text-[13px] leading-snug text-[var(--muted)]">
+                                      <div>
+                                        {buildPropInsightHeadline([
+                                          p.stars,
+                                          p.trend,
+                                          p.confidence_tier ?? p.confidence,
+                                        ]) || "—"}
+                                      </div>
                                       {Math.abs(p.opp_factor - 1) > 0.02 ? (
-                                        <span className="ml-1 font-mono">opp ×{p.opp_factor.toFixed(2)}</span>
+                                        <div
+                                          className="mt-1 text-[11px] text-[var(--muted)]"
+                                          title={opponentWeightTitle(p.opp_factor)}
+                                        >
+                                          {formatOpponentWeightLine(p.opp_factor)}
+                                        </div>
                                       ) : null}
                                     </td>
                                   </tr>
@@ -845,7 +884,9 @@ export default function Page() {
                                     </td>
                                     <td className="py-2.5 pr-3 font-mono text-sm">{pct(p.hit_rate)}</td>
                                     <td className="py-2.5 pr-3 font-mono text-sm text-[var(--muted)]">{p.avg.toFixed(1)}</td>
-                                    <td className="py-2.5 text-[13px] text-[var(--muted)]">{p.trend || "—"}</td>
+                                    <td className="py-2.5 text-[13px] text-[var(--muted)]">
+                                      {cleanInsightToken(p.trend) ?? "—"}
+                                    </td>
                                   </tr>
                                 ))}
                               </tbody>
@@ -984,26 +1025,30 @@ export default function Page() {
             </section>
 
             <section className="grid w-full grid-cols-1 gap-5 md:grid-cols-2">
-              {r.props_summary.best_prop && (
+              {r.props_summary.best_prop && (() => {
+                const bp = r.props_summary.best_prop;
+                const bestTrend = cleanInsightToken(bp.trend);
+                return (
                 <Card className="p-6">
                   <SectionTitle>Best player prop tonight</SectionTitle>
                   <p className="mt-3 text-[var(--text)]">
-                    {r.props_summary.best_prop.player}{" "}
-                    <span className="text-[var(--muted)]">{r.props_summary.best_prop.label}</span>
+                    {bp.player}{" "}
+                    <span className="text-[var(--muted)]">{bp.label}</span>
                   </p>
                   <p className="mt-2 font-mono text-sm text-[var(--muted)]">
-                    {pct(r.props_summary.best_prop.hit_rate)} hit rate (avg {r.props_summary.best_prop.avg.toFixed(1)} / last{" "}
-                    {r.props_summary.best_prop.n_games} games) {r.props_summary.best_prop.trend}
+                    {pct(bp.hit_rate)} hit rate (avg {bp.avg.toFixed(1)} / last {bp.n_games} games)
+                    {bestTrend ? ` · ${bestTrend}` : ""}
                   </p>
                   <AiPropLiveBar
-                    player={r.props_summary.best_prop.player}
-                    teamAbbr={(r.props_summary.best_prop.team ?? "").trim()}
-                    label={r.props_summary.best_prop.label}
-                    stat={r.props_summary.best_prop.stat}
-                    threshold={r.props_summary.best_prop.threshold}
+                    player={bp.player}
+                    teamAbbr={(bp.team ?? "").trim()}
+                    label={bp.label}
+                    stat={bp.stat}
+                    threshold={bp.threshold}
                   />
                 </Card>
-              )}
+                );
+              })()}
               {r.parlays.best_team != null && (
                 <Card className="p-6">
                   <SectionTitle>Best team parlay</SectionTitle>
