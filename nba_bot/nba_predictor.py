@@ -9,6 +9,7 @@
 #    python rolibot_v5.py             → full run, human-readable
 #    ROLI_JSON=1 python rolibot_v5.py → JSON output for UI
 #    ROLI_GAME_DATE=2026-04-10 python rolibot_v5.py → backtest
+#    ODDS_API_KEY=... → validate slate vs The Odds API (h2h + slate props; ~1+N requests)
 #
 #  SETUP (first time):
 #    pip install nba_api xgboost scikit-learn pandas numpy
@@ -124,6 +125,12 @@ _XGB_LOG      = []
 _INJURY_META  = {}
 _SKIPPED_INJ  = 0
 _SKIPPED_TRADE = 0
+
+# The Odds API — filled once in Phase 6 (session cache)
+_SESSION_ODDS_ML: dict = {}
+_ODDS_PROP_BUCKETS = None
+_NAMES_BY_STAT_ODDS = None
+_ODDS_API_ACTIVE = False
 
 # ─────────────────────────────────────────────────────────────
 #  DATE HELPERS
@@ -970,6 +977,67 @@ else:
     print("  ! No upcoming games on this slate date (or off day). ROLI_GAME_DATE=YYYY-MM-DD for backtest.")
     print("  ! If games already Final, set ROLI_SCOREBOARD_SKIP_FINAL=0 to re-include them.\n")
 
+# --- The Odds API: one h2h batch + one props request per slate game (after injuries, before rosters) ---
+_odds_key = (os.environ.get("ODDS_API_KEY") or "").strip()
+_SESSION_ODDS_ML = {}
+_ODDS_PROP_BUCKETS = None
+_NAMES_BY_STAT_ODDS = None
+_ODDS_API_ACTIVE = False
+if not _odds_key:
+    print("  ! ODDS_API_KEY not set — skipping sportsbook validation (set it to cross-check ML/props vs books).\n")
+elif not tonight:
+    pass
+else:
+    try:
+        import the_odds_api as _roli_odds
+        print("  Fetching The Odds API (h2h board + slate props)...")
+        ml_map, ml_err = _roli_odds.fetch_real_odds(_odds_key)
+        if ml_err:
+            print(f"  ! The Odds API h2h failed: {ml_err}\n")
+        elif ml_map:
+            _SESSION_ODDS_ML = ml_map
+            _ODDS_API_ACTIVE = True
+            before_n = len(tonight)
+            matched = []
+            for pair in tonight:
+                k = frozenset({pair[0].upper(), pair[1].upper()})
+                if k in ml_map:
+                    matched.append(pair)
+                else:
+                    print(
+                        f"  ! No book line for {pair[0]} @ {pair[1]} — dropped (not on Odds API board)."
+                    )
+            tonight = matched
+            event_ids = []
+            for pair in tonight:
+                k = frozenset({pair[0].upper(), pair[1].upper()})
+                row = ml_map.get(k) or {}
+                eid = row.get("event_id")
+                if eid:
+                    event_ids.append(str(eid))
+            if event_ids:
+                _ODDS_PROP_BUCKETS, _NAMES_BY_STAT_ODDS = _roli_odds.fetch_real_props(
+                    _odds_key, event_ids, normalize_name
+                )
+            else:
+                _ODDS_PROP_BUCKETS, _NAMES_BY_STAT_ODDS = None, None
+            if before_n and not tonight:
+                print(
+                    "  ! Slate empty after Odds API filter — no games on the board for this date.\n"
+                )
+            else:
+                print()
+        else:
+            print("  ! The Odds API returned no NBA h2h events — continuing without book filter.\n")
+    except ImportError:
+        print("  ! the_odds_api module missing — skipping Odds API.\n")
+    except Exception as _e_odds:
+        print(f"  ! Odds API error: {_e_odds} — continuing without book filter.\n")
+        _SESSION_ODDS_ML = {}
+        _ODDS_PROP_BUCKETS = None
+        _NAMES_BY_STAT_ODDS = None
+        _ODDS_API_ACTIVE = False
+
 # ============================================================
 #  PHASE 7 — LIVE ROSTER + PROPS
 #  Zero hardcoded player names. Every player verified:
@@ -996,6 +1064,87 @@ PROP_LINES = {
 def prop_lbl(stat,t):
     return {'PTS':f"{t}+ Pts",'REB':f"{t}+ Reb",'AST':f"{t}+ Ast",
             'FG3M':f"{t}+ 3PM",'STL':f"{t}+ Stl",'BLK':f"{t}+ Blk"}.get(stat,f"{t}+ {stat}")
+
+_BOOK_TAG_SHORT = {
+    "draftkings": "DK",
+    "fanduel": "FD",
+    "betmgm": "MGM",
+    "williamhill_us": "WH",
+    "caesars": "CZR",
+    "pointsbetus": "PB",
+    "wynnbet": "Wynn",
+    "barstool": "BS",
+    "betrivers": "RSI",
+    "unibet_us": "UB",
+    "bovada": "BV",
+    "mybookieag": "MB",
+    "betonlineag": "BO",
+    "lowvig": "LV",
+}
+
+
+def _prop_book_bracket(p):
+    if p.get("book_odds") is None:
+        return ""
+    bk = (p.get("bookmaker_key") or "").lower()
+    ab = _BOOK_TAG_SHORT.get(bk, (bk[:3] + "   ")[:3].upper() if bk else "BK")
+    o = int(p["book_odds"])
+    os_ = f"+{o}" if o > 0 else str(o)
+    return f" [{ab} {os_}]"
+
+
+def _find_offer_for_prop(player_name, stat, line):
+    """Return (point, american, bookmaker_key, bookmaker_title) or None."""
+    if not _ODDS_API_ACTIVE or _ODDS_PROP_BUCKETS is None or _NAMES_BY_STAT_ODDS is None:
+        return None
+    if stat not in ("PTS", "REB", "AST", "FG3M"):
+        return None
+    norm = normalize_name(player_name)
+    cand = _ODDS_PROP_BUCKETS.get((norm, stat))
+    if not cand:
+        for alt in _NAMES_BY_STAT_ODDS.get(stat, ()):
+            if names_match(player_name, {alt}):
+                cand = _ODDS_PROP_BUCKETS.get((alt, stat))
+                if cand:
+                    break
+    if not cand:
+        return None
+    line_f = float(line)
+    best = None
+    best_d = 999.0
+    for pt, price, bk_key, bk_title in cand:
+        d = abs(float(pt) - line_f)
+        if d <= 1.251 and d < best_d:
+            best_d = d
+            best = (pt, price, bk_key, bk_title)
+    return best
+
+
+def _attach_odds_to_prop(prop):
+    if not _ODDS_API_ACTIVE:
+        prop["verified"] = True
+        return
+    if _ODDS_PROP_BUCKETS is None:
+        prop["verified"] = True
+        prop["book_skip"] = "props_feed_unavailable"
+        return
+    stat = prop.get("stat") or ""
+    if stat not in ("PTS", "REB", "AST", "FG3M"):
+        prop["verified"] = True
+        prop["book_skip"] = "no_props_market"
+        return
+    row = _find_offer_for_prop(prop["player"], stat, prop["threshold"])
+    if not row:
+        prop["verified"] = False
+        prop["skip_reason"] = "not_offered"
+        return
+    pt, price, bk_key, bk_title = row
+    prop["verified"] = True
+    prop["book_odds"] = int(price)
+    prop["bookmaker_key"] = bk_key
+    prop["bookmaker"] = bk_title or bk_key
+    prop["book_line"] = float(pt)
+
 
 def compute_props(name, log, team_abbr, opp_abbr):
     """Compute all prop lines for a verified player."""
@@ -1052,7 +1201,7 @@ def compute_props(name, log, team_abbr, opp_abbr):
             adj_hr = min(0.97,max(0.03,w_hr*opp_fac)) if stat in ('PTS','FG3M') else w_hr
             if adj_hr>0.97 or adj_hr<0.03: continue
 
-            props.append({
+            row = {
                 'player':name,'team':team_abbr,'opp':opp_abbr,
                 'stat':stat,'threshold':line,'label':prop_lbl(stat,line),
                 'hit_rate':adj_hr,'raw_hr':raw_hr,
@@ -1063,7 +1212,9 @@ def compute_props(name, log, team_abbr, opp_abbr):
                 'min_flag':min_flag,'min_recent':min_recent_val,
                 'opp_factor':opp_fac,
                 'inj_status':player_injury_status(name,injuries),
-            })
+            }
+            _attach_odds_to_prop(row)
+            props.append(row)
 
     # Dedupe: drop easier line when raw hit rate almost same as harder line
     by_stat = defaultdict(list)
@@ -1213,6 +1364,56 @@ for away_abbr,home_abbr in tonight:
         'kelly_amt':kelly,'props':gprops,'analysis':analysis,
     })
 
+try:
+    from the_odds_api import american_to_implied_prob as _imp_ml_book
+except ImportError:
+    _imp_ml_book = None
+for g in game_results:
+    g.setdefault("value_bet", False)
+    g.setdefault("line_discrepancy", False)
+    g.setdefault("book_pick_ml", None)
+    g.setdefault("book_implied_pick", None)
+    g.setdefault("book_line_note", "")
+    if not _ODDS_API_ACTIVE or not _SESSION_ODDS_ML or _imp_ml_book is None:
+        continue
+    mk = frozenset({g["away_abbr"].upper(), g["home_abbr"].upper()})
+    row = _SESSION_ODDS_ML.get(mk)
+    if not row:
+        continue
+    pick = (g["pick_abbr"] or "").upper()
+    ha = row.get("home_abbr") or ""
+    aa = row.get("away_abbr") or ""
+    if pick == ha.upper():
+        ml = row.get("home_ml")
+    elif pick == aa.upper():
+        ml = row.get("away_ml")
+    else:
+        continue
+    if ml is None:
+        continue
+    try:
+        ml_i = int(ml)
+    except (TypeError, ValueError):
+        continue
+    implied = float(_imp_ml_book(ml_i))
+    g["book_pick_ml"] = ml_i
+    g["book_implied_pick"] = implied
+    pp = float(g["pick_prob"])
+    edge_pp = pp - implied
+    if edge_pp > 0.05:
+        g["value_bet"] = True
+    if abs(edge_pp) > 0.15:
+        g["line_discrepancy"] = True
+        g["book_line_note"] = (
+            "Large gap vs book ML — edge may be priced in elsewhere or the model may be off."
+        )
+    if pp > 0.55 and implied < 0.40:
+        g["line_discrepancy"] = True
+        if not g["book_line_note"]:
+            g["book_line_note"] = (
+                "Model probability is much higher than the book moneyline implies."
+            )
+
 game_results.sort(key=lambda x: x['edge'],reverse=True)
 
 # ── Print predictions ──────────────────────────────────────
@@ -1226,6 +1427,20 @@ for g in game_results:
     print(f"  Home ({g['home_abbr']}): {g['prob_home']:.1%}  {prob_to_american(g['prob_home'])}")
     print(f"  Away ({g['away_abbr']}): {g['prob_away']:.1%}  {prob_to_american(g['prob_away'])}")
     print(f"  Pick: {g['pick_name']} ({g['pick_side']})  [{g['confidence']} {g['stars']}]")
+    if _ODDS_API_ACTIVE and g.get("book_implied_pick") is not None:
+        bml = g.get("book_pick_ml")
+        if isinstance(bml, int):
+            bstr = f"+{bml}" if bml > 0 else str(bml)
+            print(f"  Book ML (pick side): {bstr}")
+        else:
+            print(f"  Book ML (pick side): {bml}")
+        print(f"  Book implied win prob (pick): {g['book_implied_pick']:.1%}")
+    if g.get("value_bet") and g.get("book_implied_pick") is not None:
+        print(
+            f"  [VALUE vs book]  model {g['pick_prob']:.1%} vs book-implied {g['book_implied_pick']:.1%}"
+        )
+    if g.get("line_discrepancy") and g.get("book_line_note"):
+        print(f"  ! Line discrepancy: {g['book_line_note']}")
     if g['kelly_amt']>0 and g['edge']>=MIN_EDGE_FOR_BET:
         print(f"  Kelly: ${g['kelly_amt']:,.2f}")
     if g['analysis']:
@@ -1241,12 +1456,17 @@ print("=" * 62)
 
 all_safe  = []
 all_risky = []
+all_unverified = []
 
 for g in game_results:
     print(f"\n  {g['away_name']} @ {g['home_name']}")
     print("  " + "-"*50)
     props  = g['props']
-    safe   = sorted([p for p in props if p['hit_rate']>=0.65 and not p['min_flag']],
+    safe   = sorted([p for p in props if p['hit_rate']>=0.65 and not p['min_flag']
+                     and p.get('verified', True) is not False],
+                    key=lambda x: x['hit_rate'],reverse=True)
+    unver  = sorted([p for p in props if p['hit_rate']>=0.65 and not p['min_flag']
+                     and p.get('verified') is False],
                     key=lambda x: x['hit_rate'],reverse=True)
     risky  = sorted([p for p in props if 0.33<=p['hit_rate']<0.50],
                     key=lambda x: x['hit_rate'],reverse=True)
@@ -1259,7 +1479,8 @@ for g in game_results:
             tr  = f" [{p['trend']}]" if p['trend'] else ''
             adj = f" [opp x{p['opp_factor']:.2f}]" if abs(p['opp_factor']-1)>0.02 else ''
             inj = f" [{p['inj_status']}]" if p['inj_status'] else ''
-            print(f"    {p['player']:26s}  {p['label']:16s}  {p['hit_rate']:.0%}  {s}{tr}{adj}{inj}")
+            bk  = _prop_book_bracket(p)
+            print(f"    {p['player']:26s}  {p['label']:16s}  {p['hit_rate']:.0%}  {s}{bk}{tr}{adj}{inj}")
         all_safe.extend(safe)
     else:
         print("  (No strong props — many players out or low-scoring game)")
@@ -1275,6 +1496,18 @@ for g in game_results:
         for pl in flagged[:3]:
             mp = next((p for p in props if p['player']==pl and p['min_flag']),None)
             if mp: print(f"    {pl} — recent {mp['min_recent']} mpg  (MINS_DROP)")
+
+    if unver:
+        all_unverified.extend(unver)
+
+if all_unverified:
+    print()
+    print("  " + "-" * 50)
+    print("  PROPS NOT OFFERED BY BOOKS — skip these")
+    print("  " + "-" * 50)
+    for p in sorted(all_unverified, key=lambda x: x['hit_rate'], reverse=True)[:28]:
+        sr = p.get('skip_reason') or 'not_offered'
+        print(f"    {p['player']:26s}  {p['label']:16s}  {p['hit_rate']:.0%}  ({sr})")
 
 # ============================================================
 #  PHASE 10 — PARLAY BUILDER
@@ -1317,7 +1550,8 @@ if safe_parlays:
         for leg in p['legs']:
             _,st = prop_conf(leg['hit_rate'])
             tr   = f" [{leg['trend']}]" if leg['trend'] else ''
-            print(f"    {leg['player']:26s}  {leg['label']:16s}  {leg['hit_rate']:.0%}  {st}{tr}")
+            bk   = _prop_book_bracket(leg)
+            print(f"    {leg['player']:26s}  {leg['label']:16s}  {leg['hit_rate']:.0%}  {st}{bk}{tr}")
         print()
 
 if sgp_parlays:
@@ -1326,7 +1560,8 @@ if sgp_parlays:
         game_tag = f"{p['legs'][0]['opp']} @ {p['legs'][0]['team']}" if p['legs'] else ''
         print(f"  SGP #{i}  {p['n']}-leg  {game_tag}  {p['combined']:.1%}  ${p['payout']:,.0f}")
         for leg in p['legs']:
-            print(f"    {leg['player']:26s}  {leg['label']:16s}  {leg['hit_rate']:.0%}")
+            bk = _prop_book_bracket(leg)
+            print(f"    {leg['player']:26s}  {leg['label']:16s}  {leg['hit_rate']:.0%}{bk}")
         print()
 
 if risky_parlays:
@@ -1364,12 +1599,15 @@ if mixed:
         g  = m['game']
         k  = kelly_bet(m['combined'],prob_to_american(m['combined']))
         print(f"  MIXED #{i}  {m['n']}-leg  {m['combined']:.1%}  ${m['payout']:,.0f}  Kelly ${k:,.2f}")
-        print(f"    {g['pick_name']:30s} ML  {g['pick_prob']:.0%}  {g['stars']}")
+        vg = "  [VALUE vs book]" if m['game'].get("value_bet") else ""
+        print(f"    {g['pick_name']:30s} ML  {g['pick_prob']:.0%}  {g['stars']}{vg}")
         p1=m['prop']
-        print(f"    {p1['player']:26s}  {p1['label']:16s}  {p1['hit_rate']:.0%}  [{p1['trend']}]" if p1['trend'] else f"    {p1['player']:26s}  {p1['label']:16s}  {p1['hit_rate']:.0%}")
+        b1 = _prop_book_bracket(p1)
+        print(f"    {p1['player']:26s}  {p1['label']:16s}  {p1['hit_rate']:.0%}{b1}  [{p1['trend']}]" if p1['trend'] else f"    {p1['player']:26s}  {p1['label']:16s}  {p1['hit_rate']:.0%}{b1}")
         if 'prop2' in m:
             p2=m['prop2']
-            print(f"    {p2['player']:26s}  {p2['label']:16s}  {p2['hit_rate']:.0%}")
+            b2 = _prop_book_bracket(p2)
+            print(f"    {p2['player']:26s}  {p2['label']:16s}  {p2['hit_rate']:.0%}{b2}")
         print()
 
 # Hot streak specials
@@ -1381,7 +1619,8 @@ if hot:
         for i,p in enumerate(hp,1):
             print(f"  HOT #{i}  {p['n']}-leg  {p['combined']:.1%}  ${p['payout']:,.0f}")
             for leg in p['legs']:
-                print(f"    {leg['player']:26s}  {leg['label']:16s}  {leg['hit_rate']:.0%}  [{leg['trend']}]  recent {leg['avg_recent']:.1f} vs season {leg['avg']:.1f}")
+                bk = _prop_book_bracket(leg)
+                print(f"    {leg['player']:26s}  {leg['label']:16s}  {leg['hit_rate']:.0%}{bk}  [{leg['trend']}]  recent {leg['avg_recent']:.1f} vs season {leg['avg']:.1f}")
             print()
 
 # ============================================================
@@ -1404,18 +1643,21 @@ if strong_g:
     print("  STRONG BETS (highest confidence)")
     for g in strong_g:
         tk+=g['kelly_amt']
-        print(f"    {g['pick_name']} ML  {g['pick_prob']:.1%}  ({g['pick_odds']})  Kelly ${g['kelly_amt']:,.2f}")
+        vb = "  [VALUE vs book]" if g.get("value_bet") else ""
+        print(f"    {g['pick_name']} ML  {g['pick_prob']:.1%}  ({g['pick_odds']})  Kelly ${g['kelly_amt']:,.2f}{vb}")
     print()
 if good_g:
     print("  GOOD BETS")
     for g in good_g:
         tk+=g['kelly_amt']
-        print(f"    {g['pick_name']} ML  {g['pick_prob']:.1%}  ({g['pick_odds']})  Kelly ${g['kelly_amt']:,.2f}")
+        vb = "  [VALUE vs book]" if g.get("value_bet") else ""
+        print(f"    {g['pick_name']} ML  {g['pick_prob']:.1%}  ({g['pick_odds']})  Kelly ${g['kelly_amt']:,.2f}{vb}")
     print()
 if lean_g:
     print("  LEAN — small stakes or parlay only")
     for g in lean_g:
-        print(f"    {g['pick_name']} ML  {g['pick_prob']:.1%}  ({g['pick_odds']})")
+        vb = "  [VALUE vs book]" if g.get("value_bet") else ""
+        print(f"    {g['pick_name']} ML  {g['pick_prob']:.1%}  ({g['pick_odds']}){vb}")
     print()
 if skip_g:
     print("  SKIP — no model edge")
@@ -1430,7 +1672,7 @@ if tk>0:
 if all_safe:
     bp=max(all_safe,key=lambda x: x['hit_rate'])
     print(f"  BEST SINGLE PROP:")
-    print(f"    {bp['player']}  {bp['label']}  {bp['hit_rate']:.0%} hit rate  avg {bp['avg']:.1f}  ({bp['n_games']} games)  [{bp['trend']}]")
+    print(f"    {bp['player']}  {bp['label']}  {bp['hit_rate']:.0%} hit rate{_prop_book_bracket(bp)}  avg {bp['avg']:.1f}  ({bp['n_games']} games)  [{bp['trend']}]")
     print()
 
 if safe_parlays:
@@ -1464,7 +1706,7 @@ print(f"  Features : {len(FEATURE_COLS)}")
 print(f"  Injuries : {len(injuries)} tracked  ({n_out} excluded)")
 print(f"  Traded   : {_SKIPPED_TRADE} players skipped (wrong team)")
 print(f"  Injured  : {_SKIPPED_INJ} players skipped (Out/GTD/Questionable)")
-print(f"  Props    : {len(all_safe)} strong  |  {len(all_risky)} risky")
+print(f"  Props    : {len(all_safe)} strong  |  {len(all_risky)} risky  |  {len(all_unverified)} not on board")
 print(f"  Games    : {len(game_results)} tonight")
 print(f"  Cache    : {'HIT' if cache_valid else 'MISS (retrained)'}")
 print(f"  LLM      : {'Claude enabled' if _USE_LLM else 'set ANTHROPIC_API_KEY to enable'}")
@@ -1505,7 +1747,7 @@ if _JSON_MODE:
 
     def sp(p):
         c,s=prop_conf(p['hit_rate'])
-        return {'player':p['player'],'team':p['team'],'opp':p['opp'],
+        o = {'player':p['player'],'team':p['team'],'opp':p['opp'],
                 'stat':p['stat'],'threshold':jf(p['threshold']),'label':p['label'],
                 'hit_rate':jf(p['hit_rate']),'raw_hr':jf(p['raw_hr']),
                 'avg':jf(p['avg']),'avg_recent':jf(p['avg_recent']),
@@ -1514,10 +1756,26 @@ if _JSON_MODE:
                 'min_flag':p.get('min_flag',''),'opp_factor':jf(p['opp_factor']),
                 'inj_status':p.get('inj_status',''),
                 'confidence':c,'stars':s}
+        if 'verified' in p:
+            o['verified'] = bool(p['verified']) if p['verified'] is not None else None
+        if p.get('skip_reason'):
+            o['skip_reason'] = p['skip_reason']
+        if p.get('book_odds') is not None:
+            o['book_odds'] = jf(p['book_odds'])
+        if p.get('bookmaker'):
+            o['bookmaker'] = p['bookmaker']
+        if p.get('bookmaker_key'):
+            o['bookmaker_key'] = p['bookmaker_key']
+        if p.get('book_line') is not None:
+            o['book_line'] = jf(p['book_line'])
+        if p.get('book_skip'):
+            o['book_skip'] = p['book_skip']
+        return o
 
     def sg(g):
         props=g['props']
-        sp_  =sorted([p for p in props if p['hit_rate']>=0.65 and not p['min_flag']],
+        sp_  =sorted([p for p in props if p['hit_rate']>=0.65 and not p['min_flag']
+                      and p.get('verified', True) is not False],
                      key=lambda x: x['hit_rate'],reverse=True)
         rp_  =sorted([p for p in props if 0.33<=p['hit_rate']<0.50],
                      key=lambda x: x['hit_rate'],reverse=True)
@@ -1530,14 +1788,25 @@ if _JSON_MODE:
                 'confidence':g['confidence'],'stars':g['stars'],
                 'kelly_amt':jf(g['kelly_amt']),
                 'analysis':g.get('analysis',''),
+                'value_bet':bool(g.get('value_bet')),
+                'line_discrepancy':bool(g.get('line_discrepancy')),
+                'book_pick_ml':jf(g.get('book_pick_ml')),
+                'book_implied_pick':jf(g.get('book_implied_pick')),
+                'book_line_note':g.get('book_line_note') or '',
                 'top_props':[sp(p) for p in sp_[:8]],
                 'risky_props':[sp(p) for p in rp_[:4]]}
 
     def spar(p):
         k=kelly_bet(p['combined'],prob_to_american(p['combined']))
-        legs=[{'player':l['player'],'label':l['label'],'hit_rate':jf(l['hit_rate']),
+        def _leg_json(l):
+            d = {'player':l['player'],'label':l['label'],'hit_rate':jf(l['hit_rate']),
                'trend':l.get('trend',''),'team':l.get('team',''),'opp':l.get('opp','')}
-              for l in p['legs']]
+            if l.get('book_odds') is not None:
+                d['book_odds'] = jf(l['book_odds'])
+            if l.get('bookmaker_key'):
+                d['bookmaker_key'] = l['bookmaker_key']
+            return d
+        legs=[_leg_json(l) for l in p['legs']]
         return {'n':p['n'],'combined':jf(p['combined']),'payout':jf(p['payout']),
                 'implied_american':prob_to_american(p['combined']),'kelly':jf(k),'legs':legs}
 
@@ -1546,6 +1815,12 @@ if _JSON_MODE:
     lean_j   = [g for g in game_results if 0.05<=g['edge']<0.09]
     skip_j   = [g for g in game_results if g['edge']<0.05]
     tk_j     = sum(float(g['kelly_amt']) for g in strong_j+good_j)
+
+    try:
+        from the_odds_api import get_last_quota as _roli_get_odds_quota
+        _roli_odds_quota = _roli_get_odds_quota()
+    except Exception:
+        _roli_odds_quota = {}
 
     report = {
         'ok':True,'brand':'RoliBot NBA v5',
@@ -1596,7 +1871,16 @@ if _JSON_MODE:
         },
         'props_summary':{
             'n_strong':len(all_safe),'n_risky':len(all_risky),
+            'n_unverified_board':len(all_unverified),
             'best_prop':sp(max(all_safe,key=lambda x:x['hit_rate'])) if all_safe else None,
+        },
+        'props_unverified':[
+            sp(p) for p in sorted(all_unverified, key=lambda x: x['hit_rate'], reverse=True)[:40]
+        ],
+        'odds_api':{
+            'enabled': bool(_ODDS_API_ACTIVE),
+            'key_configured': bool((os.environ.get("ODDS_API_KEY") or "").strip()),
+            'quota': _roli_odds_quota,
         },
         'daily_update_instructions':{
             'windows':'Task Scheduler -> python rolibot_v5.py -> daily 1PM ET',
