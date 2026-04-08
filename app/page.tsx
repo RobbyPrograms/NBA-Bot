@@ -5,6 +5,7 @@ import { useCallback, useEffect, useState } from "react";
 import type { GameRow, HotPropParlay, MixedParlay, RolibotReport, RiskyPropParlay, SafePropParlay } from "@/lib/types";
 import { mockReport } from "@/lib/mock-report";
 import {
+  collectReportTeamAbbrs,
   firstRiskyParlay,
   firstSafeParlay,
   injurySummary,
@@ -26,6 +27,8 @@ import {
   StatTile,
   ThemeToggle,
 } from "@/components/rolibot-ui";
+import { AiPropLiveBar } from "@/components/ai-prop-live-bar";
+import { LiveNbaErrorBanner, LiveNbaProvider } from "@/components/live-nba-context";
 
 const API_PATH = "/api/rolibot";
 
@@ -43,6 +46,7 @@ function ParlayLegMismatch({ declared, actual }: { declared: number; actual: num
 }
 
 function GamePredictionCard({ g }: { g: GameRow }) {
+  const teamForProp = (p: { team?: string }) => (p.team ?? "").trim();
   const top = g.top_props ?? [];
   const risky = g.risky_props ?? [];
   const mins = g.minutes_warnings ?? [];
@@ -64,12 +68,6 @@ function GamePredictionCard({ g }: { g: GameRow }) {
       <p className="mt-1 text-sm text-[var(--muted)]">
         Signal: {g.confidence} {g.stars}
       </p>
-      {g.kelly_amt > 0 && (
-        <p className="mt-2 font-mono text-xs text-[var(--accent)]">
-          Kelly recommended: ${g.kelly_amt.toFixed(2)}
-        </p>
-      )}
-
       {g.analysis != null && g.analysis.trim() !== "" && (
         <div className="mt-4 rounded-xl border border-[var(--border)] bg-[var(--card-inner)] p-3">
           <p className="text-[11px] font-semibold uppercase tracking-wide text-[var(--muted)]">Game analysis</p>
@@ -114,6 +112,13 @@ function GamePredictionCard({ g }: { g: GameRow }) {
                     <span className="block font-mono text-[11px]">L3 avg {p.avg_recent3.toFixed(1)}</span>
                   ) : null}
                 </div>
+                <AiPropLiveBar
+                  player={p.player}
+                  teamAbbr={teamForProp(p)}
+                  label={p.label}
+                  stat={p.stat}
+                  threshold={p.threshold}
+                />
               </li>
             ))}
           </ul>
@@ -138,6 +143,13 @@ function GamePredictionCard({ g }: { g: GameRow }) {
                 <span className="shrink-0 font-mono text-sm text-[var(--muted)]">
                   {pct(p.hit_rate)} · avg {p.avg.toFixed(1)}
                 </span>
+                <AiPropLiveBar
+                  player={p.player}
+                  teamAbbr={teamForProp(p)}
+                  label={p.label}
+                  stat={p.stat}
+                  threshold={p.threshold}
+                />
               </li>
             ))}
           </ul>
@@ -175,9 +187,6 @@ function SafeParlayCard({ p, i }: { p: SafePropParlay; i: number }) {
         {p.n}-leg · {pct(p.combined)} hit · ~${p.payout} / $100
         {p.implied_american ? ` · ${p.implied_american}` : ""}
       </p>
-      {p.kelly != null && p.kelly > 0 && (
-        <p className="mt-1 font-mono text-xs text-[var(--accent)]">Kelly bet size ${p.kelly.toFixed(2)}</p>
-      )}
       <div className="mt-3 border-t border-[var(--border)] pt-3">
         <ParlayLegMismatch declared={p.n} actual={nLegs} />
         <ul className="space-y-3">
@@ -191,6 +200,12 @@ function SafeParlayCard({ p, i }: { p: SafePropParlay; i: number }) {
                 <span className="font-medium text-[var(--text)]">{leg.player}</span>{" "}
                 <span className="text-[var(--muted)]">{leg.label}</span>
               </div>
+              <AiPropLiveBar
+                player={leg.player}
+                teamAbbr={(leg.team ?? "").trim()}
+                label={leg.label}
+                dense
+              />
               <div className="mt-1 font-mono text-sm text-[var(--accent)]">{pct(leg.hit_rate)}</div>
               <div className="mt-0.5 text-[13px] text-[var(--muted)]">
                 {leg.stars ? <span>{leg.stars} </span> : null}
@@ -220,9 +235,6 @@ function RiskyParlayCard({ p, i }: { p: RiskyPropParlay; i: number }) {
         {p.n}-leg · {pct(p.combined)} · ~${p.payout} / $100
         {p.implied_american ? ` · ${p.implied_american}` : ""}
       </p>
-      {p.kelly != null && p.kelly > 0 && (
-        <p className="mt-1 font-mono text-xs text-[var(--accent)]">Kelly bet size ${p.kelly.toFixed(2)}</p>
-      )}
       <div className="mt-3 border-t border-[var(--border)] pt-3">
         <ParlayLegMismatch declared={p.n} actual={nLegs} />
         <ul className="space-y-3">
@@ -236,6 +248,12 @@ function RiskyParlayCard({ p, i }: { p: RiskyPropParlay; i: number }) {
                 <span className="font-medium text-[var(--text)]">{leg.player}</span>{" "}
                 <span className="text-[var(--muted)]">{leg.label}</span>
               </div>
+              <AiPropLiveBar
+                player={leg.player}
+                teamAbbr={(leg.team ?? "").trim()}
+                label={leg.label}
+                dense
+              />
               <div className="mt-1 font-mono text-sm text-[var(--accent)]">
                 {pct(leg.hit_rate)}
                 <span className="ml-2 text-[var(--muted)]">
@@ -280,6 +298,12 @@ function HotParlayCard({ p, i }: { p: HotPropParlay; i: number }) {
                 <span className="font-medium text-[var(--text)]">{leg.player}</span>{" "}
                 <span className="text-[var(--muted)]">{leg.label}</span>
               </div>
+              <AiPropLiveBar
+                player={leg.player}
+                teamAbbr={(leg.team ?? "").trim()}
+                label={leg.label}
+                dense
+              />
               <div className="mt-1 font-mono text-sm text-[var(--accent)]">{pct(leg.hit_rate)}</div>
               <div className="mt-1 text-[13px] text-[var(--muted)]">
                 {leg.trend ? <span>{leg.trend} </span> : null}
@@ -311,16 +335,33 @@ function MixedParlayCard({ m, i }: { m: MixedParlay; i: number }) {
         ▸ {m.prop.player} — {m.prop.label} {pct(m.prop.hit_rate)}
         {m.prop.trend ? ` ${m.prop.trend}` : ""}
       </p>
+      <AiPropLiveBar
+        player={m.prop.player}
+        teamAbbr={(m.prop.team ?? "").trim()}
+        label={m.prop.label}
+        stat={m.prop.stat}
+        threshold={m.prop.threshold}
+        dense
+      />
       {m.prop2 && (
         <p className="mt-1 text-sm text-[var(--muted)]">
           ▸ {m.prop2.player} — {m.prop2.label} {pct(m.prop2.hit_rate)}
           {m.prop2.trend ? ` ${m.prop2.trend}` : ""}
         </p>
       )}
+      {m.prop2 ? (
+        <AiPropLiveBar
+          player={m.prop2.player}
+          teamAbbr={(m.prop2.team ?? "").trim()}
+          label={m.prop2.label}
+          stat={m.prop2.stat}
+          threshold={m.prop2.threshold}
+          dense
+        />
+      ) : null}
       <p className="mt-3 font-mono text-xs text-[var(--muted)]">
         Combined {pct(m.combined)} · ~${m.payout} / $100
         {m.implied_american != null && m.implied_american !== "" ? ` · ${m.implied_american}` : ""}
-        {m.kelly != null && m.kelly > 0 ? ` · Kelly $${m.kelly.toFixed(2)}` : ""}
       </p>
     </Card>
   );
@@ -394,7 +435,7 @@ export default function Page() {
       <main className="roli-shell space-y-10 pb-14 pt-6 sm:pt-8">
         {!loading && r && (
           <p className="text-xs leading-relaxed text-[var(--muted)] sm:text-sm">
-            Ensemble ML picks, props &amp; Kelly sizing — entertainment only. Season tables &amp; training details on{" "}
+            Ensemble ML picks and props — entertainment only. Season tables &amp; training details on{" "}
             <Link href="/how-it-works" className="font-medium text-[var(--accent-2)] hover:underline">
               How it works
             </Link>
@@ -428,7 +469,9 @@ export default function Page() {
         )}
 
         {!loading && r && (
-          <>
+          <LiveNbaProvider teamAbbrs={collectReportTeamAbbrs(r)}>
+            <>
+            <LiveNbaErrorBanner />
             {usedMock && (
               <Card className="w-full border-[var(--accent-2)]/30 bg-[var(--card-inner)] p-4">
                 <p className="text-sm text-[var(--muted)]">
@@ -465,9 +508,8 @@ export default function Page() {
             <div className="grid w-full grid-cols-1 gap-4 md:grid-cols-2">
               <Card className="flex min-h-[140px] flex-col p-6">
                 <SectionTitle>Run summary</SectionTitle>
-                <p className="mt-4 font-mono text-sm leading-relaxed text-[var(--text)]">
-                  Bankroll ${r.bankroll.toLocaleString(undefined, { minimumFractionDigits: 2 })} · Kelly{" "}
-                  {pct(r.kelly_fraction)} · Max bet {pct(r.max_bet_pct)}
+                <p className="mt-4 text-sm leading-relaxed text-[var(--muted)]">
+                  Slate and model run metadata (no bankroll sizing shown in this view).
                 </p>
                 <div className="mt-3 flex flex-wrap gap-2">
                   {typeof r.llm_enabled === "boolean" &&
@@ -707,6 +749,9 @@ export default function Page() {
             <section className="w-full space-y-4">
               <div className="space-y-1">
                 <SectionHeading>Props by matchup</SectionHeading>
+                <p className="text-[11px] text-[var(--muted)]">
+                  Live bars use NBA.com box scores when today&apos;s slate matches (refreshes every 45s).
+                </p>
               </div>
               {r.games.every((g) => (g.top_props?.length ?? 0) === 0 && (g.risky_props?.length ?? 0) === 0) ? (
                 <p className="text-sm text-[var(--muted)]">No props on the slate for this run.</p>
@@ -744,7 +789,17 @@ export default function Page() {
                                 {top.map((p) => (
                                   <tr key={`${p.player}-${p.label}`} className="border-b border-[var(--border)] align-top">
                                     <td className="py-2.5 pr-3 font-medium">{p.player}</td>
-                                    <td className="py-2.5 pr-3 text-[var(--muted)]">{p.label}</td>
+                                    <td className="py-2.5 pr-3 text-[var(--muted)]">
+                                      <div>{p.label}</div>
+                                      <AiPropLiveBar
+                                        player={p.player}
+                                        teamAbbr={(p.team ?? "").trim()}
+                                        label={p.label}
+                                        stat={p.stat}
+                                        threshold={p.threshold}
+                                        dense
+                                      />
+                                    </td>
                                     <td className="py-2.5 pr-3 font-mono text-sm text-[var(--accent)]">{pct(p.hit_rate)}</td>
                                     <td className="py-2.5 text-[13px] text-[var(--muted)]">
                                       {[p.stars, p.trend, p.confidence_tier ?? p.confidence].filter(Boolean).join(" · ")}
@@ -777,7 +832,17 @@ export default function Page() {
                                 {risky.map((p) => (
                                   <tr key={`r-${p.player}-${p.label}`} className="border-b border-[var(--border)] align-top">
                                     <td className="py-2.5 pr-3 font-medium">{p.player}</td>
-                                    <td className="py-2.5 pr-3 text-[var(--muted)]">{p.label}</td>
+                                    <td className="py-2.5 pr-3 text-[var(--muted)]">
+                                      <div>{p.label}</div>
+                                      <AiPropLiveBar
+                                        player={p.player}
+                                        teamAbbr={(p.team ?? "").trim()}
+                                        label={p.label}
+                                        stat={p.stat}
+                                        threshold={p.threshold}
+                                        dense
+                                      />
+                                    </td>
                                     <td className="py-2.5 pr-3 font-mono text-sm">{pct(p.hit_rate)}</td>
                                     <td className="py-2.5 pr-3 font-mono text-sm text-[var(--muted)]">{p.avg.toFixed(1)}</td>
                                     <td className="py-2.5 text-[13px] text-[var(--muted)]">{p.trend || "—"}</td>
@@ -873,7 +938,7 @@ export default function Page() {
                     <ul className="mt-2 space-y-1 text-sm text-[var(--text)]">
                       {r.bet_slip.strong.map((g) => (
                         <li key={g.pick_abbr}>
-                          {g.pick_name} ML {pct(g.pick_prob)} ({g.pick_odds}) Kelly ${g.kelly_amt.toFixed(2)}
+                          {g.pick_name} ML {pct(g.pick_prob)} ({g.pick_odds})
                         </li>
                       ))}
                     </ul>
@@ -885,7 +950,7 @@ export default function Page() {
                     <ul className="mt-2 space-y-1 text-sm text-[var(--text)]">
                       {r.bet_slip.good.map((g) => (
                         <li key={g.pick_abbr}>
-                          {g.pick_name} ML {pct(g.pick_prob)} ({g.pick_odds}) Kelly ${g.kelly_amt.toFixed(2)}
+                          {g.pick_name} ML {pct(g.pick_prob)} ({g.pick_odds})
                         </li>
                       ))}
                     </ul>
@@ -915,12 +980,6 @@ export default function Page() {
                     </ul>
                   </div>
                 )}
-                <p className="border-t border-[var(--border)] pt-4 font-mono text-sm text-[var(--muted)]">
-                  Total recommended (Kelly strong+good) ${r.bet_slip.total_kelly.toFixed(2)}
-                  {r.bet_slip.total_kelly_pct_bankroll != null && (
-                    <span> ({pct(r.bet_slip.total_kelly_pct_bankroll)} of bankroll)</span>
-                  )}
-                </p>
               </Card>
             </section>
 
@@ -936,6 +995,13 @@ export default function Page() {
                     {pct(r.props_summary.best_prop.hit_rate)} hit rate (avg {r.props_summary.best_prop.avg.toFixed(1)} / last{" "}
                     {r.props_summary.best_prop.n_games} games) {r.props_summary.best_prop.trend}
                   </p>
+                  <AiPropLiveBar
+                    player={r.props_summary.best_prop.player}
+                    teamAbbr={(r.props_summary.best_prop.team ?? "").trim()}
+                    label={r.props_summary.best_prop.label}
+                    stat={r.props_summary.best_prop.stat}
+                    threshold={r.props_summary.best_prop.threshold}
+                  />
                 </Card>
               )}
               {r.parlays.best_team != null && (
@@ -943,8 +1009,7 @@ export default function Page() {
                   <SectionTitle>Best team parlay</SectionTitle>
                   <p className="mt-3 text-[var(--text)]">{r.parlays.best_team.legs.map((l) => l.pick_name).join(" + ")}</p>
                   <p className="mt-2 font-mono text-sm text-[var(--muted)]">
-                    {pct(r.parlays.best_team.combined)} · ${r.parlays.best_team.payout} / $100 · Kelly $
-                    {r.parlays.best_team.kelly.toFixed(2)}
+                    {pct(r.parlays.best_team.combined)} · ${r.parlays.best_team.payout} / $100
                   </p>
                 </Card>
               )}
@@ -956,14 +1021,6 @@ export default function Page() {
                   </p>
                   <p className="mt-2 font-mono text-sm text-[var(--muted)]">
                     {pct(firstSafeParlay(r)!.combined)} · ${firstSafeParlay(r)!.payout} / $100
-                    {(r.highlights?.best_prop_parlay_kelly != null && r.highlights.best_prop_parlay_kelly > 0) ||
-                    (firstSafeParlay(r)!.kelly != null && firstSafeParlay(r)!.kelly! > 0) ? (
-                      <>
-                        {" "}
-                        · Kelly $
-                        {(r.highlights?.best_prop_parlay_kelly ?? firstSafeParlay(r)!.kelly ?? 0).toFixed(2)}
-                      </>
-                    ) : null}
                   </p>
                 </Card>
               )}
@@ -1012,7 +1069,8 @@ export default function Page() {
               </p>
               <p className="text-xs text-[var(--muted)]">{r.disclaimer}</p>
             </Card>
-          </>
+            </>
+          </LiveNbaProvider>
         )}
       </main>
     </div>

@@ -100,6 +100,8 @@ export interface HotParlayLeg {
   trend: string;
   avg?: number;
   avg_recent?: number;
+  team?: string;
+  opp?: string;
 }
 
 export interface HotPropParlay {
@@ -303,6 +305,10 @@ export interface RolibotReport {
       avg: number;
       n_games: number;
       trend: string;
+      team?: string;
+      stat?: string;
+      threshold?: number | null;
+      opp?: string;
     } | null;
   };
   disclaimer: string;

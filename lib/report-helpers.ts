@@ -1,5 +1,36 @@
 import type { HotPropParlay, RiskyPropParlay, RolibotReport, SafePropParlay } from "./types";
 
+/** All team tricodes referenced by the report (slate + parlays + highlights) for live NBA polling. */
+export function collectReportTeamAbbrs(r: RolibotReport): string[] {
+  const s = new Set<string>();
+  for (const g of r.games) {
+    s.add(g.home_abbr.toUpperCase());
+    s.add(g.away_abbr.toUpperCase());
+  }
+  const addTeam = (t: string | undefined) => {
+    const x = t?.trim();
+    if (x) s.add(x.toUpperCase());
+  };
+  for (const p of parlaySafeList(r)) {
+    for (const l of p.legs ?? []) addTeam(l.team);
+  }
+  for (const p of parlayRiskyList(r)) {
+    for (const l of p.legs ?? []) addTeam(l.team);
+  }
+  for (const p of parlaySgpList(r)) {
+    for (const l of p.legs ?? []) addTeam(l.team);
+  }
+  for (const p of parlayHotList(r)) {
+    for (const l of p.legs ?? []) addTeam(l.team);
+  }
+  for (const m of r.parlays.mixed ?? []) {
+    addTeam(m.prop.team);
+    if (m.prop2) addTeam(m.prop2.team);
+  }
+  if (r.props_summary?.best_prop?.team) addTeam(r.props_summary.best_prop.team);
+  return [...s];
+}
+
 export function parlaySafeList(r: RolibotReport): SafePropParlay[] {
   const p = r.parlays;
   if (p.safe_props && p.safe_props.length > 0) return p.safe_props;
