@@ -1,4 +1,5 @@
 # RoliBot predictor + tiny HTTP server for Railway (or any Docker host).
+# Optional history: SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY → upserts each successful report to Supabase.
 FROM python:3.12-slim-bookworm
 
 WORKDIR /app

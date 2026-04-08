@@ -426,6 +426,12 @@ export default function Page() {
             <span className="hidden truncate text-xs text-[var(--muted)] sm:inline">Robby Rolison</span>
           </div>
           <div className="flex shrink-0 items-center gap-4">
+            <Link
+              href="/history"
+              className="hidden text-sm font-medium text-[var(--accent-2)] hover:underline sm:inline"
+            >
+              History
+            </Link>
             <NavHowItWorks />
             <ThemeToggle />
           </div>
