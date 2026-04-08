@@ -5,12 +5,15 @@ Set ROLI_REPORT_URL in Vercel to: https://<your-service>.up.railway.app/live-rep
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 from flask import Flask, Response, jsonify, request
@@ -76,11 +79,65 @@ def _record(cp: subprocess.CompletedProcess[str]) -> None:
     if cp.returncode == 0:
         _last["error"] = None
         LOG.info("Predictor finished OK → %s", REPORT_PATH)
+        try:
+            _maybe_push_supabase_snapshot()
+        except Exception as e:
+            LOG.warning("Supabase snapshot failed (non-fatal): %s", e)
     else:
         tail = (cp.stderr or "")[-4000:] + (cp.stdout or "")[-4000:]
         _last["error"] = tail.strip() or f"exit code {cp.returncode}"
         LOG.error("Predictor failed: %s", _last["error"][:500])
     _last["finished_at"] = time.time()
+
+
+def _maybe_push_supabase_snapshot() -> None:
+    """
+    Upsert full JSON report to Supabase for /history (free tier OK).
+    Env: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY (service role — never in browser).
+    """
+    base = (os.environ.get("SUPABASE_URL") or "").strip().rstrip("/")
+    key = (os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or "").strip()
+    if not base or not key:
+        return
+    if not REPORT_PATH.is_file():
+        return
+    raw = REPORT_PATH.read_text(encoding="utf-8")
+    data = json.loads(raw)
+    slate = data.get("slate_date")
+    if isinstance(slate, str) and len(slate) >= 10:
+        slate_date = slate[:10]
+    else:
+        gen = data.get("generated_at")
+        if isinstance(gen, str) and len(gen) >= 10:
+            slate_date = gen[:10]
+        else:
+            LOG.warning("Supabase: could not derive slate_date from report")
+            return
+    row = {
+        "slate_date": slate_date,
+        "report": data,
+        "generated_at": data.get("generated_at"),
+    }
+    body = json.dumps(row, ensure_ascii=False).encode("utf-8")
+    url = f"{base}/rest/v1/slate_reports"
+    req = urllib.request.Request(
+        url,
+        data=body,
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "apikey": key,
+            "Authorization": f"Bearer {key}",
+            "Prefer": "resolution=merge-duplicates",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=45) as resp:
+            if resp.status not in (200, 201, 204):
+                LOG.warning("Supabase POST unexpected status %s", resp.status)
+    except urllib.error.HTTPError as e:
+        err_body = e.read().decode("utf-8", "replace")[:500]
+        LOG.warning("Supabase HTTP %s: %s", e.code, err_body)
 
 
 def _refresh_loop() -> None:
