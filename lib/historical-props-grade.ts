@@ -1,3 +1,4 @@
+import { NBA_CDN_FETCH_HEADERS } from "@/lib/nba-cdn-headers";
 import { findBoardGame, gameRowIsFinal, type NbaBoardGame } from "@/lib/nba-dated-scoreboard";
 import {
   getPlayerStatFromBoxscore,
@@ -14,7 +15,7 @@ export async function fetchBoxscoreParsed(gameId: string): Promise<ParsedBoxscor
   const url = `https://cdn.nba.com/static/json/liveData/boxscore/boxscore_${encodeURIComponent(gameId)}.json`;
   const res = await fetch(url, {
     cache: "no-store",
-    headers: { Accept: "application/json" },
+    headers: NBA_CDN_FETCH_HEADERS,
   });
   if (!res.ok) return null;
   let u: unknown;
