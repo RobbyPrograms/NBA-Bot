@@ -130,6 +130,25 @@ export default function HowItWorksPage() {
           </ol>
         </section>
 
+        <section id="start-free" className="scroll-mt-24 space-y-4 rounded-2xl border border-[var(--accent)]/25 bg-[var(--card)] p-6 shadow-[var(--shadow-card)]">
+          <h2 className="text-xl font-bold text-[var(--text)]">Start free (today)</h2>
+          <p className="leading-relaxed text-[var(--muted)]">
+            The <strong className="text-[var(--text)]">live slate, model picks, props, and parlay math</strong> on the
+            home dashboard are free to use—point the site at your hosted predictor JSON and you&apos;re live. No payment
+            is required to explore tonight&apos;s board or read the methodology here.
+          </p>
+          <p className="leading-relaxed text-[var(--muted)]">
+            <strong className="text-[var(--text)]">Why &quot;pay&quot; might exist later:</strong> optional premium
+            add-ons (push alerts, CSV exports, custom bankroll profiles, API rate limits) can help cover compute and
+            data costs. Nothing here is a promise of profit; any future paid tier would be clearly labeled and optional.
+          </p>
+          <p className="text-sm text-[var(--muted)]">
+            <a href="/" className="font-semibold text-[var(--accent)] hover:underline">
+              ← Back to tonight&apos;s picks
+            </a>
+          </p>
+        </section>
+
         <section className="rounded-2xl border border-[var(--gold)]/30 bg-[var(--card-inner)] p-6">
           <h2 className="text-lg font-bold text-[var(--text)]">Disclaimer</h2>
           <p className="mt-2 text-sm leading-relaxed text-[var(--muted)]">

@@ -28,6 +28,7 @@ import {
   ThemeToggle,
 } from "@/components/rolibot-ui";
 import { AiPropLiveBar } from "@/components/ai-prop-live-bar";
+import { LandingHero } from "@/components/landing-hero";
 import { LiveNbaErrorBanner, LiveNbaProvider } from "@/components/live-nba-context";
 
 const API_PATH = "/api/rolibot";
@@ -439,6 +440,8 @@ export default function Page() {
       </header>
 
       <main className="roli-shell space-y-10 pb-14 pt-6 sm:pt-8">
+        <LandingHero />
+
         {!loading && r && (
           <p className="text-xs leading-relaxed text-[var(--muted)] sm:text-sm">
             Ensemble ML picks and props — entertainment only. Season tables &amp; training details on{" "}
@@ -511,7 +514,7 @@ export default function Page() {
               </Card>
             )}
 
-            <div className="grid w-full grid-cols-1 gap-4 md:grid-cols-2">
+            <div id="tonights-picks" className="grid w-full scroll-mt-24 grid-cols-1 gap-4 md:grid-cols-2">
               <Card className="flex min-h-[140px] flex-col p-6">
                 <SectionTitle>Run summary</SectionTitle>
                 <p className="mt-4 text-sm leading-relaxed text-[var(--muted)]">

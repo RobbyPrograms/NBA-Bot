@@ -95,6 +95,28 @@ function gradeOne(g: GameJson, board: NbaBoardGame[]): MlPickGrade {
   };
 }
 
+/** Use when the scoreboard for `slateDate` is already loaded (avoids duplicate fetches). */
+export function gradeMlPicksWithBoard(
+  slateDate: string,
+  games: unknown,
+  board: NbaBoardGame[]
+): MlGradingResult {
+  if (!Array.isArray(games)) {
+    return {
+      slate_date: slateDate,
+      games: [],
+      board_games_found: board.length,
+      scoreboard_error: "Report has no games array.",
+    };
+  }
+  const grades = (games as GameJson[]).map((g) => gradeOne(g, board));
+  return {
+    slate_date: slateDate,
+    games: grades,
+    board_games_found: board.length,
+  };
+}
+
 /** Grade moneyline picks in a stored report's `games` array vs NBA box score for that slate date. */
 export async function gradeMlPicksForReport(
   slateDate: string,
@@ -121,10 +143,5 @@ export async function gradeMlPicksForReport(
     };
   }
 
-  const grades = (games as GameJson[]).map((g) => gradeOne(g, board));
-  return {
-    slate_date: slateDate,
-    games: grades,
-    board_games_found: board.length,
-  };
+  return gradeMlPicksWithBoard(slateDate, games, board);
 }
