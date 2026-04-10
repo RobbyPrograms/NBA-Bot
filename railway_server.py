@@ -54,6 +54,14 @@ app = Flask(__name__)
 _run_lock = threading.Lock()
 _last: dict = {"ok": False, "error": None, "finished_at": None}
 _predictor_running = False
+# Last Supabase snapshot attempt (visible on GET / for debugging).
+_supabase_push: dict = {
+    "ok": None,
+    "slate_date": None,
+    "error": None,
+    "skipped_reason": "no_attempt_yet",
+    "at": None,
+}
 
 
 def _run_predictor() -> subprocess.CompletedProcess[str]:
@@ -96,11 +104,32 @@ def _maybe_push_supabase_snapshot() -> None:
     Upsert full JSON report to Supabase for /history (free tier OK).
     Env: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY (service role — never in browser).
     """
+    global _supabase_push
+    now = time.time()
     base = (os.environ.get("SUPABASE_URL") or "").strip().rstrip("/")
     key = (os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or "").strip()
     if not base or not key:
+        _supabase_push = {
+            "ok": False,
+            "slate_date": None,
+            "error": None,
+            "skipped_reason": "missing_env_set_SUPABASE_URL_and_SUPABASE_SERVICE_ROLE_KEY",
+            "at": now,
+        }
+        LOG.warning(
+            "Supabase upload skipped: set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY on this Railway service "
+            "(service role key from Supabase → Settings → API; anon key will not insert into slate_reports)."
+        )
         return
     if not REPORT_PATH.is_file():
+        _supabase_push = {
+            "ok": False,
+            "slate_date": None,
+            "error": None,
+            "skipped_reason": "report_file_missing",
+            "at": now,
+        }
+        LOG.warning("Supabase upload skipped: report file not found at %s", REPORT_PATH)
         return
     raw = REPORT_PATH.read_text(encoding="utf-8")
     data = json.loads(raw)
@@ -113,6 +142,13 @@ def _maybe_push_supabase_snapshot() -> None:
             slate_date = gen[:10]
         else:
             LOG.warning("Supabase: could not derive slate_date from report")
+            _supabase_push = {
+                "ok": False,
+                "slate_date": None,
+                "error": "could_not_derive_slate_date",
+                "skipped_reason": None,
+                "at": now,
+            }
             return
     row = {
         "slate_date": slate_date,
@@ -135,10 +171,43 @@ def _maybe_push_supabase_snapshot() -> None:
     try:
         with urllib.request.urlopen(req, timeout=45) as resp:
             if resp.status not in (200, 201, 204):
+                msg = f"unexpected_status_{resp.status}"
+                _supabase_push = {
+                    "ok": False,
+                    "slate_date": slate_date,
+                    "error": msg,
+                    "skipped_reason": None,
+                    "at": now,
+                }
                 LOG.warning("Supabase POST unexpected status %s", resp.status)
+            else:
+                _supabase_push = {
+                    "ok": True,
+                    "slate_date": slate_date,
+                    "error": None,
+                    "skipped_reason": None,
+                    "at": now,
+                }
+                LOG.info("Supabase slate_reports upsert OK for slate_date=%s", slate_date)
     except urllib.error.HTTPError as e:
         err_body = e.read().decode("utf-8", "replace")[:500]
+        _supabase_push = {
+            "ok": False,
+            "slate_date": slate_date,
+            "error": f"HTTP {e.code}: {err_body}",
+            "skipped_reason": None,
+            "at": now,
+        }
         LOG.warning("Supabase HTTP %s: %s", e.code, err_body)
+    except Exception as e:
+        _supabase_push = {
+            "ok": False,
+            "slate_date": slate_date,
+            "error": str(e),
+            "skipped_reason": None,
+            "at": now,
+        }
+        LOG.warning("Supabase upload failed: %s", e)
 
 
 def _refresh_loop() -> None:
@@ -188,6 +257,7 @@ def health():
         report_ready=REPORT_PATH.is_file(),
         predictor_running=_predictor_running,
         last_run=_last,
+        supabase_push=_supabase_push,
     )
 
 
