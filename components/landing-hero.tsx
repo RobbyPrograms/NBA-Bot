@@ -8,9 +8,18 @@ type PropSlice = { hits: number; misses: number; total: number; pct: number | nu
 type TrackPayload = {
   ok: boolean;
   configured?: boolean;
-  ml?: { hits: number; misses: number; total: number; pct: number | null };
+  ml?: {
+    hits: number;
+    misses: number;
+    total: number;
+    pct: number | null;
+    picks_tracked?: number;
+    awaiting_final?: number;
+    unmatched_schedule?: number;
+  };
   team_parlay?: { hits: number; total: number; pct: number | null };
   props?: { lifetime: PropSlice; last7: PropSlice };
+  all_bets?: { lifetime: PropSlice; last7: PropSlice };
   slates_used?: number;
   disclaimer?: string;
 };
@@ -43,12 +52,60 @@ export function LandingHero() {
   const parlay = tr?.team_parlay;
   const propsLife = tr?.props?.lifetime;
   const props7 = tr?.props?.last7;
-  const showStats =
-    tr?.ok &&
-    tr?.configured &&
-    ((ml && ml.total > 0) ||
-      (propsLife && propsLife.total > 0) ||
-      (parlay && parlay.total > 0));
+  const allLife = tr?.all_bets?.lifetime;
+  const all7 = tr?.all_bets?.last7;
+
+  const trackStatus = (() => {
+    if (tr == null) return { tone: "muted" as const, text: "Loading track record…" };
+    if (!tr.ok) return { tone: "warn" as const, text: "Couldn’t load track record. Try again later." };
+    if (!tr.configured) {
+      const isDev = process.env.NODE_ENV === "development";
+      return {
+        tone: "muted" as const,
+        text: isDev
+          ? "Local: add SUPABASE_URL and SUPABASE_ANON_KEY to .env.local (project root), restart npm run dev. Railway writes slates to Supabase; this Next.js app reads them for the hero."
+          : "Graded numbers load from saved slate history. They stay empty until this site’s hosting is configured to read that database.",
+      };
+    }
+    const any =
+      (allLife?.total ?? 0) > 0 ||
+      (ml?.total ?? 0) > 0 ||
+      (propsLife?.total ?? 0) > 0 ||
+      (parlay?.total ?? 0) > 0;
+    if (!any) {
+      const af = ml?.awaiting_final ?? 0;
+      const um = ml?.unmatched_schedule ?? 0;
+      if (af > 0) {
+        return {
+          tone: "muted" as const,
+          text: `Slates are linked. ${af} game(s) match the NBA schedule but aren’t Final yet—ML % and W/L appear after the buzzer.`,
+        };
+      }
+      if (um > 0) {
+        return {
+          tone: "muted" as const,
+          text: `${um} saved pick(s) didn’t match the official scoreboard for that slate date (wrong calendar day or schedule). Props/parlays need the same fix.`,
+        };
+      }
+      return {
+        tone: "muted" as const,
+        text: "Slates are linked; percentages fill in as games go final and props resolve.",
+      };
+    }
+    return null;
+  })();
+
+  const mlSubline = (() => {
+    if (!ml) return "No graded ML rows yet";
+    if (ml.total > 0) return `${ml.hits}W · ${ml.misses}L · ${ml.total} picks`;
+    const pt = ml.picks_tracked ?? 0;
+    const af = ml.awaiting_final ?? 0;
+    const um = ml.unmatched_schedule ?? 0;
+    if (pt > 0 && af > 0) return `${af} on schedule, not Final · ${pt} ML rows in history`;
+    if (pt > 0 && um > 0) return `${um} no NBA match for that date · ${pt} ML rows in history`;
+    if (pt > 0) return `${pt} ML rows in history — no closed grades yet`;
+    return "No graded ML rows yet";
+  })();
 
   return (
     <section
@@ -110,70 +167,98 @@ export function LandingHero() {
         </div>
 
         <div className="flex flex-col gap-4">
-          {showStats ? (
-            <div className="rounded-2xl border border-[var(--border)] bg-[var(--surface-bg)]/80 p-5 backdrop-blur-sm dark:bg-black/40">
-              <p className="text-[11px] font-semibold uppercase tracking-wider text-[var(--muted)]">
-                Graded track record
+          <div
+            className="rounded-2xl border border-[var(--border)] bg-[var(--surface-bg)]/80 p-5 backdrop-blur-sm dark:bg-black/40"
+            aria-busy={tr == null}
+          >
+            <p className="text-[11px] font-semibold uppercase tracking-wider text-[var(--muted)]">
+              Graded track record
+            </p>
+            {trackStatus ? (
+              <p
+                className={
+                  trackStatus.tone === "warn"
+                    ? "mt-2 text-[11px] leading-snug text-amber-800 dark:text-amber-200/90"
+                    : "mt-2 text-[11px] leading-snug text-[var(--muted)]"
+                }
+              >
+                {trackStatus.text}
               </p>
-              <div className="mt-4 grid grid-cols-2 gap-4">
-                <div>
-                  <p className="font-mono text-4xl font-bold tabular-nums text-[var(--accent)] sm:text-5xl">
-                    {ml && ml.total > 0 ? pctDisplay(ml.pct) : "—"}
-                  </p>
-                  <p className="mt-1 text-xs font-medium text-[var(--text)]">ML pick accuracy</p>
-                  <p className="mt-0.5 text-[11px] text-[var(--muted)]">
-                    {ml && ml.total > 0
-                      ? `${ml.hits}W · ${ml.misses}L · ${ml.total} picks`
-                      : "No graded ML rows yet"}
-                  </p>
-                </div>
-                <div>
-                  <p className="font-mono text-2xl font-bold tabular-nums text-[var(--accent-2)] sm:text-3xl">
-                    {parlay && parlay.total > 0 ? pctDisplay(parlay.pct) : "—"}
-                  </p>
-                  <p className="mt-1 text-xs font-medium text-[var(--text)]">Featured ML parlay</p>
-                  <p className="mt-0.5 text-[11px] leading-snug text-[var(--muted)]">
-                    {parlay && parlay.total > 0
-                      ? `${parlay.hits}/${parlay.total} resolved (nightly best-team combo)`
-                      : "Not enough graded parlays yet"}
-                  </p>
-                </div>
-                <div>
-                  <p className="font-mono text-2xl font-bold tabular-nums text-[var(--accent)] sm:text-3xl">
-                    {propsLife && propsLife.total > 0 ? pctDisplay(propsLife.pct) : "—"}
-                  </p>
-                  <p className="mt-1 text-xs font-medium text-[var(--text)]">Props hit rate (lifetime)</p>
-                  <p className="mt-0.5 text-[11px] text-[var(--muted)]">
-                    {propsLife && propsLife.total > 0
-                      ? `${propsLife.hits}H · ${propsLife.misses}M · ${propsLife.total} graded`
-                      : "No resolved props in saved slates yet"}
-                  </p>
-                </div>
-                <div>
-                  <p className="font-mono text-2xl font-bold tabular-nums text-[var(--accent-2)] sm:text-3xl">
-                    {props7 && props7.total > 0 ? pctDisplay(props7.pct) : "—"}
-                  </p>
-                  <p className="mt-1 text-xs font-medium text-[var(--text)]">Props (last 7 days)</p>
-                  <p className="mt-0.5 text-[11px] text-[var(--muted)]">
-                    {props7 && props7.total > 0
-                      ? `${props7.hits}H · ${props7.misses}M · ${props7.total} graded`
-                      : "Nothing final in this window yet"}
-                  </p>
-                </div>
+            ) : null}
+            <div className="mt-4 grid grid-cols-2 gap-x-4 gap-y-5">
+              <div className="col-span-2 sm:col-span-1">
+                <p className="text-[10px] font-bold uppercase tracking-wide text-[var(--accent-2)]">
+                  All published bets
+                </p>
+                <p className="font-mono text-4xl font-bold tabular-nums text-[var(--accent)] sm:text-5xl">
+                  {allLife && allLife.total > 0 ? pctDisplay(allLife.pct) : "—"}
+                </p>
+                <p className="mt-1 text-xs font-medium text-[var(--text)]">Lifetime hit rate</p>
+                <p className="mt-0.5 text-[11px] text-[var(--muted)]">
+                  {allLife && allLife.total > 0
+                    ? `${allLife.hits}H · ${allLife.misses}M · ${allLife.total} graded (ML + props + parlay slips + mixed + featured)`
+                    : "Nothing resolved yet—needs finals + leg team tags on parlays"}
+                </p>
               </div>
-              {tr?.slates_used != null ? (
-                <p className="mt-3 text-[10px] text-[var(--muted)]">Across {tr.slates_used} saved slate(s) in history.</p>
-              ) : null}
+              <div className="col-span-2 sm:col-span-1">
+                <p className="text-[10px] font-bold uppercase tracking-wide text-[var(--accent-2)]">
+                  All published bets
+                </p>
+                <p className="font-mono text-3xl font-bold tabular-nums text-[var(--accent-2)] sm:text-4xl">
+                  {all7 && all7.total > 0 ? pctDisplay(all7.pct) : "—"}
+                </p>
+                <p className="mt-1 text-xs font-medium text-[var(--text)]">Last 7 days</p>
+                <p className="mt-0.5 text-[11px] text-[var(--muted)]">
+                  {all7 && all7.total > 0
+                    ? `${all7.hits}H · ${all7.misses}M · ${all7.total} graded`
+                    : "No closed grades in this window"}
+                </p>
+              </div>
+              <div>
+                <p className="font-mono text-2xl font-bold tabular-nums text-[var(--accent)] sm:text-3xl">
+                  {ml && ml.total > 0 ? pctDisplay(ml.pct) : "—"}
+                </p>
+                <p className="mt-1 text-xs font-medium text-[var(--text)]">ML only (games)</p>
+                <p className="mt-0.5 text-[11px] text-[var(--muted)]">{mlSubline}</p>
+              </div>
+              <div>
+                <p className="font-mono text-xl font-bold tabular-nums text-[var(--accent-2)] sm:text-2xl">
+                  {parlay && parlay.total > 0 ? pctDisplay(parlay.pct) : "—"}
+                </p>
+                <p className="mt-1 text-xs font-medium text-[var(--text)]">Featured ML parlay</p>
+                <p className="mt-0.5 text-[11px] leading-snug text-[var(--muted)]">
+                  {parlay && parlay.total > 0
+                    ? `${parlay.hits}/${parlay.total} resolved (nightly best-team combo)`
+                    : "Not enough graded parlays yet"}
+                </p>
+              </div>
+              <div>
+                <p className="font-mono text-xl font-bold tabular-nums text-[var(--accent)] sm:text-2xl">
+                  {propsLife && propsLife.total > 0 ? pctDisplay(propsLife.pct) : "—"}
+                </p>
+                <p className="mt-1 text-xs font-medium text-[var(--text)]">Matchup props only</p>
+                <p className="mt-0.5 text-[11px] text-[var(--muted)]">
+                  {propsLife && propsLife.total > 0
+                    ? `${propsLife.hits}H · ${propsLife.misses}M · ${propsLife.total} graded`
+                    : "No resolved props in saved slates yet"}
+                </p>
+              </div>
+              <div>
+                <p className="font-mono text-xl font-bold tabular-nums text-[var(--accent-2)] sm:text-2xl">
+                  {props7 && props7.total > 0 ? pctDisplay(props7.pct) : "—"}
+                </p>
+                <p className="mt-1 text-xs font-medium text-[var(--text)]">Matchup props (7d)</p>
+                <p className="mt-0.5 text-[11px] text-[var(--muted)]">
+                  {props7 && props7.total > 0
+                    ? `${props7.hits}H · ${props7.misses}M · ${props7.total} graded`
+                    : "Nothing final in this window yet"}
+                </p>
+              </div>
             </div>
-          ) : (
-            <div className="rounded-2xl border border-dashed border-[var(--border)] bg-[var(--card-inner)]/50 p-5">
-              <p className="text-sm font-medium text-[var(--text)]">Track record unlocks with history</p>
-              <p className="mt-2 text-xs leading-relaxed text-[var(--muted)]">
-                Once slates are saved to Supabase and games go final, we show graded accuracy here—moneylines vs finals,
-                player props vs box scores, and the featured 2-leg ML parlay when it resolves.
-              </p>
-            </div>
-          )}
+            {tr?.slates_used != null ? (
+              <p className="mt-3 text-[10px] text-[var(--muted)]">Across {tr.slates_used} saved slate(s) in history.</p>
+            ) : null}
+          </div>
 
           <div className="grid gap-3 sm:grid-cols-3">
             <div className="rounded-xl border border-[var(--border)] bg-[var(--card)]/90 p-4 shadow-[var(--shadow-sm)]">

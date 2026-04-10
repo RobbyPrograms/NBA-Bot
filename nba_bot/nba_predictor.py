@@ -535,18 +535,18 @@ all_games = []
 for season in _seasons:
     print(f"  {season}...", end=" ", flush=True)
     for attempt in range(_SEASON_FETCH_ATTEMPTS):
-        try:
-            gf = leaguegamefinder.LeagueGameFinder(
-                season_nullable=season,
+    try:
+        gf = leaguegamefinder.LeagueGameFinder(
+            season_nullable=season,
                 season_type_nullable="Regular Season",
                 timeout=_NBA_API_TIMEOUT,
-            )
-            df = gf.get_data_frames()[0]
-            all_games.append(df)
+        )
+        df = gf.get_data_frames()[0]
+        all_games.append(df)
             _SEASON_LOG.append({"season": season, "rows": int(len(df))})
             print(f"ok  {len(df):,}")
             break
-        except Exception as e:
+    except Exception as e:
             if attempt < _SEASON_FETCH_ATTEMPTS - 1:
                 time.sleep(_SLEEP_RETRY * (attempt + 1))
             else:
@@ -1432,7 +1432,7 @@ for g in game_results:
         if isinstance(bml, int):
             bstr = f"+{bml}" if bml > 0 else str(bml)
             print(f"  Book ML (pick side): {bstr}")
-        else:
+    else:
             print(f"  Book ML (pick side): {bml}")
         print(f"  Book implied win prob (pick): {g['book_implied_pick']:.1%}")
     if g.get("value_bet") and g.get("book_implied_pick") is not None:
@@ -1921,6 +1921,10 @@ if _JSON_MODE:
     )
     out_path = os.environ.get("ROLI_JSON_OUT")
     if out_path:
-        with open(out_path,"w",encoding="utf-8") as f: f.write(payload)
+        # Atomic replace so HTTP readers never see a truncated live-report.json mid-write.
+        tmp_path = out_path + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            f.write(payload)
+        os.replace(tmp_path, out_path)
     else:
         print(payload)

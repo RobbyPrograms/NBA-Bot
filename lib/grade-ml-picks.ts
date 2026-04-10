@@ -1,7 +1,7 @@
 import {
   fetchNbaScoreboardForDate,
   findBoardGame,
-  isFinalStatus,
+  gameRowIsFinal,
   winnerAbbr,
   type NbaBoardGame,
 } from "@/lib/nba-dated-scoreboard";
@@ -63,7 +63,7 @@ function gradeOne(g: GameJson, board: NbaBoardGame[]): MlPickGrade {
       note: "No matching game on NBA scoreboard for this date (wrong date or schedule mismatch).",
     };
   }
-  const fin = isFinalStatus(row.statusText);
+  const fin = gameRowIsFinal(row);
   const win = winnerAbbr(row);
   let pick_correct: boolean | null = null;
   let note: string | undefined;

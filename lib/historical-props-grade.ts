@@ -1,4 +1,4 @@
-import { findBoardGame, isFinalStatus, type NbaBoardGame } from "@/lib/nba-dated-scoreboard";
+import { findBoardGame, gameRowIsFinal, type NbaBoardGame } from "@/lib/nba-dated-scoreboard";
 import {
   getPlayerStatFromBoxscore,
   isGameFinal,
@@ -49,7 +49,7 @@ export async function prefetchBoxscoresForReportGames(
   const ids = new Set<string>();
   for (const g of gameRows) {
     const bg = findBoardGame(board, g.home_abbr, g.away_abbr);
-    if (!bg?.gameId || !isFinalStatus(bg.statusText)) continue;
+    if (!bg?.gameId || !gameRowIsFinal(bg)) continue;
     ids.add(bg.gameId);
   }
   await Promise.all(

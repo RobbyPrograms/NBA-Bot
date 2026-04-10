@@ -19,17 +19,23 @@ export async function OPTIONS() {
 
 const getCachedTrackRecord = unstable_cache(
   async () => computeTrackRecord(40),
-  ["rolibot-track-record-v2-props"],
+  ["rolibot-track-record-v3-all-bets"],
   { revalidate: 3600 }
 );
 
 export async function GET() {
   try {
-    const body = await getCachedTrackRecord();
+    // In dev, skip unstable_cache so SUPABASE_* changes in .env.local apply without waiting for revalidate.
+    const body =
+      process.env.NODE_ENV === "development"
+        ? await computeTrackRecord(40)
+        : await getCachedTrackRecord();
     return NextResponse.json(body, {
       headers: {
         ...corsHeaders,
-        "Cache-Control": "public, s-maxage=3600, stale-while-revalidate=7200",
+        ...(process.env.NODE_ENV === "development"
+          ? { "Cache-Control": "no-store" }
+          : { "Cache-Control": "public, s-maxage=3600, stale-while-revalidate=7200" }),
       },
     });
   } catch (e) {

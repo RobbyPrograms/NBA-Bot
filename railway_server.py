@@ -46,6 +46,7 @@ def _resolve_report_path() -> Path:
 
 
 REPORT_PATH = _resolve_report_path()
+# Default 6h — fine for batch “daily card.” For live slates, set e.g. ROLI_REFRESH_SECONDS=900 (15m) or 1800 (30m) on Railway.
 REFRESH_SEC = int(os.environ.get("ROLI_REFRESH_SECONDS", str(6 * 3600)))
 FIRST_DELAY_SEC = int(os.environ.get("ROLI_FIRST_RUN_DELAY_SECONDS", "0"))
 
