@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { NBA_CDN_FETCH_HEADERS } from "@/lib/nba-cdn-headers";
 
 const GAME_ID_RE = /^\d{10}$/;
 
@@ -11,7 +12,7 @@ export async function GET(_req: Request, ctx: { params: Promise<{ gameId: string
   try {
     const res = await fetch(url, {
       cache: "no-store",
-      headers: { Accept: "application/json" },
+      headers: NBA_CDN_FETCH_HEADERS,
     });
     if (!res.ok) {
       return NextResponse.json({ error: `NBA boxscore HTTP ${res.status}` }, { status: 502 });
