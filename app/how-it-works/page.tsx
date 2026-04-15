@@ -1,4 +1,5 @@
 import type { Metadata } from "next";
+import { CalibrationChart } from "@/components/CalibrationChart";
 import { DocsTopBar } from "@/components/docs-top-bar";
 import { PageBackdrop } from "@/components/rolibot-ui";
 
@@ -115,6 +116,16 @@ export default function HowItWorksPage() {
             activity is filtered so long-term IR doesn&apos;t slip through. Same-game parlays (SGP) are listed separately;
             hit probabilities still multiply legs (books price correlation).
           </p>
+        </section>
+
+        <section className="space-y-4">
+          <h2 className="text-xl font-bold text-[var(--text)]">Live calibration (graded picks)</h2>
+          <p className="text-[var(--muted)] leading-relaxed">
+            After the morning grading job fills <code className="font-mono text-xs text-[var(--accent)]">graded_picks</code>,
+            this chart compares each model-confidence bucket to realized hit rates. Points hugging the diagonal mean
+            stated probabilities matched outcomes — a sanity check before trusting Kelly-style sizing.
+          </p>
+          <CalibrationChart />
         </section>
 
         <section className="space-y-4">

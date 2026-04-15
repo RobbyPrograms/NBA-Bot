@@ -2,6 +2,9 @@
 
 import Link from "next/link";
 import { useCallback, useEffect, useState } from "react";
+import { DailyChart } from "@/components/DailyChart";
+import { PickHistory } from "@/components/PickHistory";
+import { PropLeaderboard } from "@/components/PropLeaderboard";
 import { Card, PageBackdrop, SectionHeading, ThemeToggle } from "@/components/rolibot-ui";
 import type { MlGradingResult, MlPickGrade } from "@/lib/grade-ml-picks";
 
@@ -110,6 +113,19 @@ export default function HistoryPage() {
           Saved reports from Supabase (after each successful Railway run). Moneyline picks are
           checked against NBA final scores for that calendar date. Entertainment only.
         </p>
+
+        <section className="space-y-6">
+          <SectionHeading>Graded picks (Supabase)</SectionHeading>
+          <p className="text-xs text-[var(--muted)]">
+            Charts and tables read from <code className="font-mono text-[var(--accent)]">pick_stats</code>,{" "}
+            <code className="font-mono text-[var(--accent)]">daily_stats</code>, and{" "}
+            <code className="font-mono text-[var(--accent)]">recent_picks</code>. Set{" "}
+            <code className="font-mono text-[var(--accent)]">NEXT_PUBLIC_SUPABASE_*</code> on Vercel for live data.
+          </p>
+          <DailyChart />
+          <PickHistory />
+          <PropLeaderboard />
+        </section>
 
         {loadingList && <p className="text-sm text-[var(--muted)]">Loading saved dates…</p>}
         {err && (
